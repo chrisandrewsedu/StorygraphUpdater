@@ -125,20 +125,29 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
         // Wait for results to load
         await page.waitForSelector('.book-title-author-and-series', { timeout: 10000 }).catch(() => null);
 
+        // Also take a debug screenshot so we can inspect page structure
+        await page.screenshot({ path: path.join(screenshotsDir, 'debug-search-latest.png'), fullPage: true });
+
         const results = await page.evaluate(() => {
           const bookElements = document.querySelectorAll('.book-title-author-and-series');
           return Array.from(bookElements).slice(0, 10).map((el) => {
+            // Title is usually in the first <a> tag
             const linkEl = el.querySelector('a');
-            const titleEl = el.querySelector('a');
+            const title = linkEl?.textContent?.trim() || '';
+            const bookUrl = linkEl?.getAttribute('href') || '';
+
+            // Author: look for "by" text pattern or a separate p/span after the title link
+            // The element class is "book-title-author-and-series" so author text is inside it
+            const fullText = el.textContent || '';
+            const byMatch = fullText.match(/by\s+(.+?)(?:\s*\(|$)/);
+            const author = byMatch ? byMatch[1].trim() : '';
+
+            // Edition info from parent card
             const parentCard = el.closest('[class*="book-pane"]') || el.parentElement;
             const editionEl = parentCard?.querySelector('.text-sm.text-darkestGrey, .text-sm.font-light');
+            const editionInfo = editionEl?.textContent?.trim() || '';
 
-            return {
-              title: titleEl?.textContent?.trim() || '',
-              author: '',
-              bookUrl: linkEl?.getAttribute('href') || '',
-              editionInfo: editionEl?.textContent?.trim() || '',
-            };
+            return { title, author, bookUrl, editionInfo };
           });
         });
 
