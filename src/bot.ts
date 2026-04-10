@@ -53,6 +53,11 @@ export function createBot(options: CreateBotOptions): Bot {
 
   // ── Helper utilities ─────────────────────────────────────────────────────────
 
+  /** Escape Telegram legacy Markdown special characters: _ * ` [ */
+  function escapeMd(text: string): string {
+    return text.replace(/([_*`\[])/g, '\\$1');
+  }
+
   async function reply(chatIdTarget: string | number, text: string, extra?: TelegramBot.SendMessageOptions): Promise<void> {
     try {
       await bot.sendMessage(chatIdTarget, text, { parse_mode: 'Markdown', ...extra });
@@ -178,12 +183,12 @@ export function createBot(options: CreateBotOptions): Bot {
           const mapping = db.getBookMappingByAbsId(book.absLibraryItemId);
           const lastSync = mapping ? db.getLastSync(mapping.id) : null;
           const syncInfo = lastSync
-            ? `Last sync: ${lastSync.action} at ${lastSync.syncedAt}`
+            ? `Last sync: ${escapeMd(lastSync.action)} at ${escapeMd(lastSync.syncedAt)}`
             : mapping
               ? 'Mapped but never synced'
               : 'Not mapped to StoryGraph';
 
-          lines.push(`*${book.title}* by ${book.author}`);
+          lines.push(`*${escapeMd(book.title)}* by ${escapeMd(book.author)}`);
           lines.push(`  Progress: ${book.progressPercent.toFixed(1)}%`);
           lines.push(`  ${syncInfo}`);
           lines.push('');
@@ -769,8 +774,8 @@ export function createBot(options: CreateBotOptions): Bot {
     for (const r of results) {
       const actionLabel = r.action.replace(/_/g, ' ');
       const percentStr = r.percent != null ? ` (${Math.round(r.percent)}%)` : '';
-      lines.push(`${r.success ? '✅' : '❌'} *${r.book}* — ${actionLabel}${percentStr}`);
-      if (!r.success && r.error) lines.push(`  _Error: ${r.error}_`);
+      lines.push(`${r.success ? '✅' : '❌'} *${escapeMd(r.book)}* — ${actionLabel}${percentStr}`);
+      if (!r.success && r.error) lines.push(`  _Error: ${escapeMd(r.error)}_`);
     }
     await reply(chatId, lines.join('\n'));
   }
