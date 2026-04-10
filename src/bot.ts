@@ -423,13 +423,19 @@ export function createBot(options: CreateBotOptions): Bot {
       await reply(cid, `Loading editions (filtering for audiobooks)...`);
       try {
         const allEditions = await storygraph.getEditions(bookUrl);
-        // For /link, filter to audio editions only
+        // For /link, filter to audio editions only, prefer English
         const audioEditions = allEditions.filter((e) => e.format === 'audio' || e.format === 'audiobook');
+        // Prioritize English editions (info containing "English" or not containing other languages)
+        const englishAudio = audioEditions.filter((e) => {
+          const lower = e.info.toLowerCase();
+          return lower.includes('english') || (!lower.includes('spanish') && !lower.includes('french') && !lower.includes('german') && !lower.includes('portuguese') && !lower.includes('italian'));
+        });
+        const filteredAudio = englishAudio.length > 0 ? englishAudio : audioEditions;
+
         const booksInProgress = await absClient.getItemsInProgress();
         const absBook = booksInProgress.find((b) => b.absLibraryItemId === absId);
 
-        if (audioEditions.length === 0) {
-          // No audio editions found — show all editions or link directly
+        if (filteredAudio.length === 0) {
           if (allEditions.length === 0) {
             await reply(cid, `No editions found. Linking directly...`);
             db.upsertBookMapping({
@@ -441,17 +447,16 @@ export function createBot(options: CreateBotOptions): Bot {
             });
             await reply(cid, `Linked *${absBook?.title ?? absId}* to StoryGraph!\n${bookUrl}`);
           } else {
-            await reply(cid, `No audiobook editions found. Showing all ${allEditions.length} editions:`);
-            await sendEditionResults(cid, allEditions,
+            await reply(cid, `No audiobook editions found. Showing first 3 of ${allEditions.length} editions:`);
+            await sendEditionResults(cid, allEditions.slice(0, 3),
               (e) => `lk_ed:${absId}:${cacheUrl(e.bookUrl)}`,
               '');
           }
           return;
         }
 
-        if (audioEditions.length === 1) {
-          // Auto-select the only audiobook edition
-          const edition = audioEditions[0];
+        if (filteredAudio.length === 1) {
+          const edition = filteredAudio[0];
           db.upsertBookMapping({
             absLibraryItemId: absId,
             storygraphBookUrl: edition.bookUrl || bookUrl,
@@ -463,10 +468,28 @@ export function createBot(options: CreateBotOptions): Bot {
           return;
         }
 
-        // Multiple audio editions — let user pick
-        await sendEditionResults(cid, audioEditions,
+        // Multiple audio editions — show first 3, with "show more" if needed
+        const PAGE_SIZE = 3;
+        const first = filteredAudio.slice(0, PAGE_SIZE);
+        await sendEditionResults(cid, first,
           (e) => `lk_ed:${absId}:${cacheUrl(e.bookUrl)}`,
-          `Found ${audioEditions.length} audiobook editions. Pick one:`);
+          `Found ${filteredAudio.length} audiobook editions (showing first ${Math.min(PAGE_SIZE, filteredAudio.length)}):`);
+
+        if (filteredAudio.length > PAGE_SIZE) {
+          // Cache the remaining editions for "show more"
+          const remainingId = cacheUrl(JSON.stringify({
+            absId,
+            editions: filteredAudio.slice(PAGE_SIZE).map((e) => ({
+              ...e,
+              bookUrl: e.bookUrl,
+            })),
+          }));
+          await reply(cid, `${filteredAudio.length - PAGE_SIZE} more audiobook editions available.`, {
+            reply_markup: {
+              inline_keyboard: [[{ text: 'Show more editions', callback_data: `lk_more:${remainingId}` }]],
+            },
+          });
+        }
       } catch (err) {
         logger.error('editions fetch error', err);
         await reply(cid, `Failed to load editions: ${err instanceof Error ? err.message : String(err)}\n\nLinking to the main book page instead.`);
@@ -480,6 +503,38 @@ export function createBot(options: CreateBotOptions): Bot {
           editionType: 'audio',
         });
         await reply(cid, `Linked *${absBook?.title ?? absId}* to StoryGraph!\n${bookUrl}`);
+      }
+      return;
+    }
+
+    // lk_more:<cacheId> → show more audiobook editions
+    if (data.startsWith('lk_more:')) {
+      const cacheId = parseInt(data.slice(8), 10);
+      const cached = getCachedUrl(cacheId);
+      if (!cached) { await reply(cid, 'Button expired. Please search again.'); return; }
+      try {
+        const { absId: moreAbsId, editions: moreEditions } = JSON.parse(cached) as {
+          absId: string;
+          editions: StoryGraphEdition[];
+        };
+        const PAGE_SIZE = 3;
+        const page = moreEditions.slice(0, PAGE_SIZE);
+        await sendEditionResults(cid, page,
+          (e) => `lk_ed:${moreAbsId}:${cacheUrl(e.bookUrl)}`,
+          `More audiobook editions:`);
+        if (moreEditions.length > PAGE_SIZE) {
+          const nextId = cacheUrl(JSON.stringify({
+            absId: moreAbsId,
+            editions: moreEditions.slice(PAGE_SIZE),
+          }));
+          await reply(cid, `${moreEditions.length - PAGE_SIZE} more available.`, {
+            reply_markup: {
+              inline_keyboard: [[{ text: 'Show more editions', callback_data: `lk_more:${nextId}` }]],
+            },
+          });
+        }
+      } catch (err) {
+        await reply(cid, `Failed to load more editions: ${err instanceof Error ? err.message : String(err)}`);
       }
       return;
     }
