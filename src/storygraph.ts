@@ -129,23 +129,23 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
         await page.screenshot({ path: path.join(screenshotsDir, 'debug-search-latest.png'), fullPage: true });
 
         const results = await page.evaluate(() => {
+          // Each search result card contains the book info
+          // Structure: cover image | book-title-author-and-series (title link, author, page info) | buttons
           const bookElements = document.querySelectorAll('.book-title-author-and-series');
           return Array.from(bookElements).slice(0, 10).map((el) => {
-            // Title is usually in the first <a> tag
             const linkEl = el.querySelector('a');
             const title = linkEl?.textContent?.trim() || '';
             const bookUrl = linkEl?.getAttribute('href') || '';
 
-            // Author: look for "by" text pattern or a separate p/span after the title link
-            // The element class is "book-title-author-and-series" so author text is inside it
+            // Author is plain text after the title link, before page/format info
+            // Get all text, remove the title, then the first remaining line is the author
             const fullText = el.textContent || '';
-            const byMatch = fullText.match(/by\s+(.+?)(?:\s*\(|$)/);
-            const author = byMatch ? byMatch[1].trim() : '';
+            const lines = fullText.split('\n').map(l => l.trim()).filter(Boolean);
+            // lines[0] is title, lines[1] is author, lines[2+] is page count/format/editions
+            const author = lines.length > 1 ? lines[1] : '';
 
-            // Edition info from parent card
-            const parentCard = el.closest('[class*="book-pane"]') || el.parentElement;
-            const editionEl = parentCard?.querySelector('.text-sm.text-darkestGrey, .text-sm.font-light');
-            const editionInfo = editionEl?.textContent?.trim() || '';
+            // Edition info: "305 pages • hardcover • 2017 > • 111 editions"
+            const editionInfo = lines.length > 2 ? lines[2] : '';
 
             return { title, author, bookUrl, editionInfo };
           });
