@@ -120,12 +120,25 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
     async searchBooks(query: string): Promise<StoryGraphSearchResult[]> {
       return withRetry('search', async () => {
         const searchUrl = `https://app.thestorygraph.com/browse?search_term=${encodeURIComponent(query)}`;
+        logger.info(`StoryGraph search: navigating to ${searchUrl}`);
         await page.goto(searchUrl, { waitUntil: 'networkidle2', timeout: 15000 });
+        logger.info(`StoryGraph search: page loaded, URL is ${page.url()}`);
+
+        // Check if we hit a Turnstile/challenge page
+        const pageContent = await page.content();
+        if (pageContent.includes('security verification') || pageContent.includes('cf-turnstile')) {
+          logger.warn('StoryGraph search: hit Cloudflare Turnstile challenge, waiting 10s...');
+          await sleep(10000);
+          // Reload and try again
+          await page.goto(searchUrl, { waitUntil: 'networkidle2', timeout: 15000 });
+          logger.info(`StoryGraph search: reloaded after Turnstile, URL is ${page.url()}`);
+        }
 
         // Wait for results to load
-        await page.waitForSelector('.book-title-author-and-series', { timeout: 10000 }).catch(() => null);
+        const found = await page.waitForSelector('.book-title-author-and-series', { timeout: 10000 }).catch(() => null);
+        logger.info(`StoryGraph search: results selector ${found ? 'found' : 'NOT found'}`);
 
-        // Also take a debug screenshot so we can inspect page structure
+        // Debug screenshot
         await page.screenshot({ path: path.join(screenshotsDir, 'debug-search-latest.png'), fullPage: true });
 
         const results = await page.evaluate(() => {
