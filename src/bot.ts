@@ -27,6 +27,20 @@ export function createBot(options: CreateBotOptions): Bot {
 
   const bot = new TelegramBot(token, { polling: true });
 
+  // ── URL cache for callback_data (Telegram limits to 64 bytes) ───────────────
+  const urlCache = new Map<number, string>();
+  let urlCounter = 0;
+
+  function cacheUrl(url: string): number {
+    const id = ++urlCounter;
+    urlCache.set(id, url);
+    return id;
+  }
+
+  function getCachedUrl(id: number): string | undefined {
+    return urlCache.get(id);
+  }
+
   // ── Auth guards ──────────────────────────────────────────────────────────────
 
   function isAuthorized(msg: TelegramBot.Message): boolean {
@@ -185,7 +199,7 @@ export function createBot(options: CreateBotOptions): Bot {
       const keyboard: TelegramBot.InlineKeyboardButton[][] = top5.map((r, i) => [
         {
           text: `${i + 1}. ${r.title}${r.author ? ` — ${r.author}` : ''}`,
-          callback_data: `add:${r.bookUrl}`,
+          callback_data: `add:${cacheUrl(r.bookUrl)}`,
         },
       ]);
 
@@ -275,7 +289,7 @@ export function createBot(options: CreateBotOptions): Bot {
       const keyboard: TelegramBot.InlineKeyboardButton[][] = top5.map((r, i) => [
         {
           text: `${i + 1}. ${r.title}${r.author ? ` — ${r.author}` : ''}`,
-          callback_data: `reading:${r.bookUrl}`,
+          callback_data: `reading:${cacheUrl(r.bookUrl)}`,
         },
       ]);
 
@@ -314,7 +328,7 @@ export function createBot(options: CreateBotOptions): Bot {
       const keyboard: TelegramBot.InlineKeyboardButton[][] = top5.map((r, i) => [
         {
           text: `${i + 1}. ${r.title}${r.author ? ` — ${r.author}` : ''}`,
-          callback_data: `finished:${r.bookUrl}`,
+          callback_data: `finished:${cacheUrl(r.bookUrl)}`,
         },
       ]);
 
@@ -373,7 +387,7 @@ export function createBot(options: CreateBotOptions): Bot {
       const keyboard: TelegramBot.InlineKeyboardButton[][] = top5.map((r, i) => [
         {
           text: `${i + 1}. ${r.title}${r.author ? ` — ${r.author}` : ''}`,
-          callback_data: `link:${absId}:${r.bookUrl}`,
+          callback_data: `link:${absId}:${cacheUrl(r.bookUrl)}`,
         },
       ]);
 
@@ -403,9 +417,11 @@ export function createBot(options: CreateBotOptions): Bot {
 
     await bot.answerCallbackQuery(query.id).catch(() => null);
 
-    // add:<bookUrl>
+    // add:<urlId>
     if (data.startsWith('add:')) {
-      const bookUrl = data.slice(4);
+      const urlId = parseInt(data.slice(4), 10);
+      const bookUrl = getCachedUrl(urlId);
+      if (!bookUrl) { await reply(cid, 'Button expired. Please search again.'); return; }
       if (msgId) await editMessage(cid, msgId, `Adding to TBR...`);
       try {
         await storygraph.addToTBR(bookUrl);
@@ -419,9 +435,11 @@ export function createBot(options: CreateBotOptions): Bot {
       return;
     }
 
-    // reading:<bookUrl>
+    // reading:<urlId>
     if (data.startsWith('reading:')) {
-      const bookUrl = data.slice(8);
+      const urlId = parseInt(data.slice(8), 10);
+      const bookUrl = getCachedUrl(urlId);
+      if (!bookUrl) { await reply(cid, 'Button expired. Please search again.'); return; }
       if (msgId) await editMessage(cid, msgId, `Marking as currently reading...`);
       try {
         await storygraph.markAsReading(bookUrl);
@@ -435,9 +453,11 @@ export function createBot(options: CreateBotOptions): Bot {
       return;
     }
 
-    // finished:<bookUrl>
+    // finished:<urlId>
     if (data.startsWith('finished:')) {
-      const bookUrl = data.slice(9);
+      const urlId = parseInt(data.slice(9), 10);
+      const bookUrl = getCachedUrl(urlId);
+      if (!bookUrl) { await reply(cid, 'Button expired. Please search again.'); return; }
       if (msgId) await editMessage(cid, msgId, `Marking as read...`);
       try {
         await storygraph.markAsRead(bookUrl);
@@ -451,17 +471,18 @@ export function createBot(options: CreateBotOptions): Bot {
       return;
     }
 
-    // link:<absId>:<bookUrl>  (bookUrl may contain colons, so split only twice)
+    // link:<absId>:<urlId>
     if (data.startsWith('link:')) {
       const rest = data.slice(5);
       const colonIdx = rest.indexOf(':');
       if (colonIdx === -1) return;
       const absId = rest.slice(0, colonIdx);
-      const bookUrl = rest.slice(colonIdx + 1);
+      const urlId = parseInt(rest.slice(colonIdx + 1), 10);
+      const bookUrl = getCachedUrl(urlId);
+      if (!bookUrl) { await reply(cid, 'Button expired. Please search again.'); return; }
 
       if (msgId) await editMessage(cid, msgId, `Linking book...`);
       try {
-        // Fetch the ABS book to get title/author for the mapping record
         const booksInProgress = await absClient.getItemsInProgress();
         const absBook = booksInProgress.find((b) => b.absLibraryItemId === absId);
 
@@ -484,13 +505,15 @@ export function createBot(options: CreateBotOptions): Bot {
       return;
     }
 
-    // newbook_yes:<absId>:<bookUrl>
-    if (data.startsWith('newbook_yes:')) {
-      const rest = data.slice(12);
+    // newbook_yes:<absId>:<urlId>
+    if (data.startsWith('nby:')) {
+      const rest = data.slice(4);
       const colonIdx = rest.indexOf(':');
       if (colonIdx === -1) return;
       const absId = rest.slice(0, colonIdx);
-      const bookUrl = rest.slice(colonIdx + 1);
+      const urlId = parseInt(rest.slice(colonIdx + 1), 10);
+      const bookUrl = getCachedUrl(urlId);
+      if (!bookUrl) { await reply(cid, 'Button expired. Please search again.'); return; }
 
       if (msgId) await editMessage(cid, msgId, `Setting up mapping...`);
       try {
@@ -519,9 +542,9 @@ export function createBot(options: CreateBotOptions): Bot {
     }
 
     // newbook_skip:<absId>
-    if (data.startsWith('newbook_skip:')) {
-      const absId = data.slice(13);
-      const text = `Skipped. Use /link to connect this book later.\n_ABS ID: ${absId}_`;
+    if (data.startsWith('nbs:')) {
+      const absId = data.slice(4);
+      const text = `Skipped. Use /link to connect this book later.`;
       if (msgId) await editMessage(cid, msgId, text);
       else await reply(cid, text);
       return;
@@ -552,13 +575,13 @@ export function createBot(options: CreateBotOptions): Bot {
         ...top3.map((r, i) => [
           {
             text: `${i + 1}. ${r.title}${r.author ? ` — ${r.author}` : ''}`,
-            callback_data: `newbook_yes:${book.absLibraryItemId}:${r.bookUrl}`,
+            callback_data: `nby:${book.absLibraryItemId}:${cacheUrl(r.bookUrl)}`,
           },
         ]),
         [
           {
             text: 'Skip for now',
-            callback_data: `newbook_skip:${book.absLibraryItemId}`,
+            callback_data: `nbs:${book.absLibraryItemId}`,
           },
         ],
       ];
