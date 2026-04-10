@@ -349,98 +349,157 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
 
     async updateProgress(bookUrl: string, percent: number): Promise<void> {
       return withRetry('updateProgress', async () => {
+        logger.info(`StoryGraph updateProgress: navigating to ${bookUrl}`);
         await page.goto(bookUrl, { waitUntil: 'networkidle2', timeout: 15000 });
+        await handleTurnstile(bookUrl);
 
-        const progressBtn = await page.$('[data-action*="progress"], button:has-text("Update progress"), a:has-text("Update progress")');
-        if (progressBtn) {
-          await progressBtn.click();
-          await sleep(1000);
+        // Click the pencil/edit icon next to the progress bar
+        // It has title="Edit your progress"
+        const editBtn = await page.$('[title="Edit your progress"], [aria-label="Edit your progress"]');
+        if (editBtn) {
+          logger.info('Found "Edit your progress" button, clicking...');
+          await editBtn.click();
+          await sleep(2000);
+        } else {
+          logger.warn('Could not find "Edit your progress" button');
+          await page.screenshot({ path: path.join(screenshotsDir, 'fail-progress-no-edit-btn.png'), fullPage: true });
         }
 
-        const percentInput = await page.$('input[type="number"], input[name*="progress"], input[name*="percent"]');
+        // Take a screenshot to see what the edit form looks like
+        await page.screenshot({ path: path.join(screenshotsDir, 'debug-progress-edit.png'), fullPage: true });
+
+        // Look for a percentage input field
+        const percentInput = await page.$('input[type="number"], input[type="range"], input[name*="progress"], input[name*="percent"]');
         if (percentInput) {
-          await percentInput.click({ clickCount: 3 });
+          logger.info('Found progress input, setting value...');
+          await percentInput.click({ clickCount: 3 }); // Select all existing text
           await percentInput.type(Math.round(percent).toString());
+          await sleep(500);
+        } else {
+          logger.warn('Could not find progress input field');
+          await page.screenshot({ path: path.join(screenshotsDir, 'fail-progress-no-input.png'), fullPage: true });
         }
 
+        // Submit the form
         const submitBtn = await page.$('button[type="submit"], input[type="submit"]');
         if (submitBtn) {
+          logger.info('Submitting progress update...');
           await submitBtn.click();
           await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 10000 }).catch(() => null);
         }
 
+        await page.screenshot({ path: path.join(screenshotsDir, 'debug-progress-after.png'), fullPage: true });
         logger.info(`Updated progress for ${bookUrl} to ${percent}%`);
       });
     },
 
     async markAsReading(bookUrl: string): Promise<void> {
       return withRetry('markAsReading', async () => {
+        logger.info(`StoryGraph markAsReading: navigating to ${bookUrl}`);
         await page.goto(bookUrl, { waitUntil: 'networkidle2', timeout: 15000 });
+        await handleTurnstile(bookUrl);
 
-        const statusBtn = await page.waitForSelector(
-          'button:has-text("currently reading"), button:has-text("Currently Reading"), [data-action*="reading"]',
-          { timeout: 5000 }
-        ).catch(() => null);
+        // Find and click the status dropdown (the teal button with chevron)
+        // Then look for "currently reading" option
+        const clicked = await page.evaluate(() => {
+          // Look for the dropdown trigger — it's a button/link near "to read" or status text
+          const allBtns = Array.from(document.querySelectorAll('button, a, [role="button"]'));
 
-        if (statusBtn) {
-          await statusBtn.click();
-          await sleep(1000);
-        } else {
-          const dropdownTrigger = await page.$('[data-action*="dropdown"], .dropdown-trigger, button[aria-haspopup]');
+          // First try to find a dropdown chevron/arrow near the status
+          const dropdownTrigger = allBtns.find((el) => {
+            const text = el.textContent?.toLowerCase() || '';
+            return text.includes('to read') || text.includes('currently reading') || text.includes('want to read');
+          });
+
           if (dropdownTrigger) {
-            await dropdownTrigger.click();
-            await sleep(500);
-            const readingOption = await page.waitForSelector(
-              'a:has-text("Currently Reading"), button:has-text("Currently Reading"), [data-value="currently-reading"]',
-              { timeout: 5000 }
-            );
-            await readingOption?.click();
+            (dropdownTrigger as HTMLElement).click();
+            return 'clicked_dropdown';
           }
-        }
+          return 'no_dropdown';
+        });
+        logger.info(`markAsReading: dropdown click result: ${clicked}`);
+        await sleep(1000);
+
+        // Now find "currently reading" in the revealed options
+        const selected = await page.evaluate(() => {
+          const allEls = Array.from(document.querySelectorAll('button, a, [role="menuitem"], [role="option"], li'));
+          const option = allEls.find((el) => {
+            const text = el.textContent?.trim().toLowerCase() || '';
+            return text === 'currently reading' || text === 'currently-reading';
+          });
+          if (option) {
+            (option as HTMLElement).click();
+            return 'clicked_reading';
+          }
+          return 'no_reading_option';
+        });
+        logger.info(`markAsReading: selection result: ${selected}`);
 
         await sleep(1000);
+        await page.screenshot({ path: path.join(screenshotsDir, 'debug-mark-reading.png'), fullPage: true });
         logger.info(`Marked as currently reading: ${bookUrl}`);
       });
     },
 
     async markAsRead(bookUrl: string): Promise<void> {
       return withRetry('markAsRead', async () => {
+        logger.info(`StoryGraph markAsRead: navigating to ${bookUrl}`);
         await page.goto(bookUrl, { waitUntil: 'networkidle2', timeout: 15000 });
+        await handleTurnstile(bookUrl);
 
-        const dropdownTrigger = await page.$('[data-action*="dropdown"], .dropdown-trigger, button[aria-haspopup]');
-        if (dropdownTrigger) {
-          await dropdownTrigger.click();
-          await sleep(500);
-        }
+        // The book page shows "mark as finished" as an option
+        const clicked = await page.evaluate(() => {
+          const allEls = Array.from(document.querySelectorAll('button, a, [role="button"], [role="menuitem"]'));
+          // Look for "mark as finished" or "finished" button
+          const finishedBtn = allEls.find((el) => {
+            const text = el.textContent?.trim().toLowerCase() || '';
+            return text.includes('mark as') && text.includes('finished');
+          });
+          if (finishedBtn) {
+            (finishedBtn as HTMLElement).click();
+            return 'clicked_finished';
+          }
+          // Fallback: look for "Read" option
+          const readBtn = allEls.find((el) => {
+            const text = el.textContent?.trim().toLowerCase() || '';
+            return text === 'read' || text === 'mark as read';
+          });
+          if (readBtn) {
+            (readBtn as HTMLElement).click();
+            return 'clicked_read';
+          }
+          return 'no_button_found';
+        });
+        logger.info(`markAsRead: click result: ${clicked}`);
 
-        const readOption = await page.waitForSelector(
-          'a:has-text("Read"), button:has-text("Read"), [data-value="read"]',
-          { timeout: 5000 }
-        ).catch(() => null);
-
-        if (readOption) {
-          await readOption.click();
-          await sleep(1000);
-        }
-
+        await sleep(1000);
+        await page.screenshot({ path: path.join(screenshotsDir, 'debug-mark-read.png'), fullPage: true });
         logger.info(`Marked as read: ${bookUrl}`);
       });
     },
 
     async addToTBR(bookUrl: string): Promise<void> {
       return withRetry('addToTBR', async () => {
+        logger.info(`StoryGraph addToTBR: navigating to ${bookUrl}`);
         await page.goto(bookUrl, { waitUntil: 'networkidle2', timeout: 15000 });
+        await handleTurnstile(bookUrl);
 
-        const tbrBtn = await page.waitForSelector(
-          'button:has-text("Want to Read"), button:has-text("want to read"), a:has-text("Want to Read")',
-          { timeout: 5000 }
-        ).catch(() => null);
+        const clicked = await page.evaluate(() => {
+          const allEls = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+          const tbrBtn = allEls.find((el) => {
+            const text = el.textContent?.trim().toLowerCase() || '';
+            return text.includes('want to read') || text.includes('to read');
+          });
+          if (tbrBtn) {
+            (tbrBtn as HTMLElement).click();
+            return 'clicked_tbr';
+          }
+          return 'no_tbr_button';
+        });
+        logger.info(`addToTBR: click result: ${clicked}`);
 
-        if (tbrBtn) {
-          await tbrBtn.click();
-          await sleep(1000);
-        }
-
+        await sleep(1000);
+        await page.screenshot({ path: path.join(screenshotsDir, 'debug-add-tbr.png'), fullPage: true });
         logger.info(`Added to TBR: ${bookUrl}`);
       });
     },
