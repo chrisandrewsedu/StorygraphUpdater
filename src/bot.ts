@@ -1,7 +1,7 @@
 import TelegramBot from 'node-telegram-bot-api';
 import { logger } from './logger.js';
 import type { Database } from './db.js';
-import type { StoryGraph, StoryGraphSearchResult } from './storygraph.js';
+import type { StoryGraph, StoryGraphSearchResult, StoryGraphEdition } from './storygraph.js';
 import type { AbsClient, AbsBookProgress } from './abs-client.js';
 import { runSync, type SyncResult } from './sync.js';
 
@@ -74,24 +74,20 @@ export function createBot(options: CreateBotOptions): Bot {
     }
   }
 
-  /**
-   * Send search results as individual photo messages with a select button each.
-   * Each result shows cover image, title, author, edition info, and a button.
-   * callbackPrefix is used to construct callback_data like "link:absId:urlCacheId"
-   */
+  /** Send search results as individual photo messages with a select button each. */
   async function sendSearchResults(
     chatIdTarget: string | number,
     results: StoryGraphSearchResult[],
     makeCallbackData: (r: StoryGraphSearchResult) => string,
     headerText: string
   ): Promise<void> {
-    await reply(chatIdTarget, headerText);
+    if (headerText) await reply(chatIdTarget, headerText);
 
     for (let i = 0; i < results.length; i++) {
       const r = results[i];
       const caption = `*${i + 1}. ${r.title}*${r.author ? `\n${r.author}` : ''}${r.editionInfo ? `\n_${r.editionInfo}_` : ''}`;
       const keyboard: TelegramBot.InlineKeyboardButton[][] = [[
-        { text: `Select this edition`, callback_data: makeCallbackData(r) },
+        { text: `Select this book`, callback_data: makeCallbackData(r) },
       ]];
 
       if (r.coverUrl) {
@@ -107,10 +103,41 @@ export function createBot(options: CreateBotOptions): Bot {
         }
       }
 
-      // Fallback: text-only if no cover or photo send failed
-      await reply(chatIdTarget, caption, {
-        reply_markup: { inline_keyboard: keyboard },
-      });
+      await reply(chatIdTarget, caption, { reply_markup: { inline_keyboard: keyboard } });
+    }
+  }
+
+  /** Send editions as individual photo messages with a select button each. */
+  async function sendEditionResults(
+    chatIdTarget: string | number,
+    editions: StoryGraphEdition[],
+    makeCallbackData: (e: StoryGraphEdition) => string,
+    headerText: string
+  ): Promise<void> {
+    if (headerText) await reply(chatIdTarget, headerText);
+
+    for (let i = 0; i < editions.length; i++) {
+      const e = editions[i];
+      const formatEmoji = e.format === 'audiobook' ? '🎧' : e.format === 'ebook' ? '📱' : e.format === 'hardcover' ? '📕' : e.format === 'paperback' ? '📖' : '📚';
+      const caption = `*${i + 1}. ${e.title}*\n${formatEmoji} ${e.format.toUpperCase()}${e.info ? `\n_${e.info}_` : ''}`;
+      const keyboard: TelegramBot.InlineKeyboardButton[][] = [[
+        { text: `${formatEmoji} Select ${e.format}`, callback_data: makeCallbackData(e) },
+      ]];
+
+      if (e.coverUrl) {
+        try {
+          await bot.sendPhoto(chatIdTarget, e.coverUrl, {
+            caption,
+            parse_mode: 'Markdown',
+            reply_markup: { inline_keyboard: keyboard },
+          });
+          continue;
+        } catch (err) {
+          logger.warn(`Failed to send cover photo for edition, falling back to text`);
+        }
+      }
+
+      await reply(chatIdTarget, caption, { reply_markup: { inline_keyboard: keyboard } });
     }
   }
 
@@ -130,7 +157,7 @@ export function createBot(options: CreateBotOptions): Bot {
       '/recommend — pick 3 random books from your TBR',
       '/reading <title> — mark a book as currently reading on StoryGraph',
       '/finished <title> — mark a book as read on StoryGraph',
-      '/link <title> — link an ABS book to its StoryGraph entry',
+      '/link <title> — link an ABS book to a StoryGraph edition',
     ].join('\n'));
   });
 
@@ -193,23 +220,16 @@ export function createBot(options: CreateBotOptions): Bot {
   bot.onText(/^\/search (.+)/, async (msg, match) => {
     if (!isAuthorized(msg)) return;
     const query = match?.[1]?.trim();
-    if (!query) {
-      await reply(msg.chat.id, 'Usage: /search <title>');
-      return;
-    }
+    if (!query) { await reply(msg.chat.id, 'Usage: /search <title>'); return; }
 
     await reply(msg.chat.id, `Searching StoryGraph for: *${query}*...`);
     try {
       const results = await storygraph.searchBooks(query);
-      if (results.length === 0) {
-        await reply(msg.chat.id, 'No results found.');
-        return;
-      }
+      if (results.length === 0) { await reply(msg.chat.id, 'No results found.'); return; }
 
       const lines = results.slice(0, 5).map((r, i) =>
         `${i + 1}. *${r.title}*${r.author ? ` — ${r.author}` : ''}${r.editionInfo ? `\n   _${r.editionInfo}_` : ''}\n   ${r.bookUrl}`
       );
-
       await reply(msg.chat.id, lines.join('\n\n'));
     } catch (err) {
       logger.error('/search error', err);
@@ -222,25 +242,17 @@ export function createBot(options: CreateBotOptions): Bot {
   bot.onText(/^\/add (.+)/, async (msg, match) => {
     if (!isAuthorized(msg)) return;
     const query = match?.[1]?.trim();
-    if (!query) {
-      await reply(msg.chat.id, 'Usage: /add <title>');
-      return;
-    }
+    if (!query) { await reply(msg.chat.id, 'Usage: /add <title>'); return; }
 
     await reply(msg.chat.id, `Searching for: *${query}*...`);
     try {
       const results = await storygraph.searchBooks(query);
-      if (results.length === 0) {
-        await reply(msg.chat.id, 'No results found.');
-        return;
-      }
+      if (results.length === 0) { await reply(msg.chat.id, 'No results found.'); return; }
 
-      await sendSearchResults(
-        msg.chat.id,
-        results.slice(0, 5),
-        (r) => `add:${cacheUrl(r.bookUrl)}`,
-        `Select a book to add to TBR:`
-      );
+      // For /add, show books then let user pick → then show editions
+      await sendSearchResults(msg.chat.id, results.slice(0, 5),
+        (r) => `add_ed:${cacheUrl(r.bookUrl)}`,
+        `Pick the book, then choose the edition to add:`);
     } catch (err) {
       logger.error('/add error', err);
       await reply(msg.chat.id, `Search failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -254,10 +266,7 @@ export function createBot(options: CreateBotOptions): Bot {
     await reply(msg.chat.id, 'Fetching your TBR list...');
     try {
       const books = await storygraph.getTBRList(storygraphUsername);
-      if (books.length === 0) {
-        await reply(msg.chat.id, 'Your TBR list is empty.');
-        return;
-      }
+      if (books.length === 0) { await reply(msg.chat.id, 'Your TBR list is empty.'); return; }
 
       const lines = books.slice(0, 20).map((b, i) => `${i + 1}. *${b.title}*${b.author ? ` — ${b.author}` : ''}`);
       const footer = books.length > 20 ? `\n_...and ${books.length - 20} more._` : '';
@@ -275,10 +284,7 @@ export function createBot(options: CreateBotOptions): Bot {
     await reply(msg.chat.id, 'Picking 3 random books from your TBR...');
     try {
       const books = await storygraph.getTBRList(storygraphUsername);
-      if (books.length === 0) {
-        await reply(msg.chat.id, 'Your TBR list is empty.');
-        return;
-      }
+      if (books.length === 0) { await reply(msg.chat.id, 'Your TBR list is empty.'); return; }
 
       const shuffled = [...books];
       for (let i = shuffled.length - 1; i > 0; i--) {
@@ -302,25 +308,16 @@ export function createBot(options: CreateBotOptions): Bot {
   bot.onText(/^\/reading (.+)/, async (msg, match) => {
     if (!isAuthorized(msg)) return;
     const query = match?.[1]?.trim();
-    if (!query) {
-      await reply(msg.chat.id, 'Usage: /reading <title>');
-      return;
-    }
+    if (!query) { await reply(msg.chat.id, 'Usage: /reading <title>'); return; }
 
     await reply(msg.chat.id, `Searching for: *${query}*...`);
     try {
       const results = await storygraph.searchBooks(query);
-      if (results.length === 0) {
-        await reply(msg.chat.id, 'No results found.');
-        return;
-      }
+      if (results.length === 0) { await reply(msg.chat.id, 'No results found.'); return; }
 
-      await sendSearchResults(
-        msg.chat.id,
-        results.slice(0, 5),
-        (r) => `reading:${cacheUrl(r.bookUrl)}`,
-        `Select a book to mark as currently reading:`
-      );
+      await sendSearchResults(msg.chat.id, results.slice(0, 5),
+        (r) => `rd_ed:${cacheUrl(r.bookUrl)}`,
+        `Pick the book, then choose the edition:`);
     } catch (err) {
       logger.error('/reading error', err);
       await reply(msg.chat.id, `Search failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -332,40 +329,28 @@ export function createBot(options: CreateBotOptions): Bot {
   bot.onText(/^\/finished (.+)/, async (msg, match) => {
     if (!isAuthorized(msg)) return;
     const query = match?.[1]?.trim();
-    if (!query) {
-      await reply(msg.chat.id, 'Usage: /finished <title>');
-      return;
-    }
+    if (!query) { await reply(msg.chat.id, 'Usage: /finished <title>'); return; }
 
     await reply(msg.chat.id, `Searching for: *${query}*...`);
     try {
       const results = await storygraph.searchBooks(query);
-      if (results.length === 0) {
-        await reply(msg.chat.id, 'No results found.');
-        return;
-      }
+      if (results.length === 0) { await reply(msg.chat.id, 'No results found.'); return; }
 
-      await sendSearchResults(
-        msg.chat.id,
-        results.slice(0, 5),
-        (r) => `finished:${cacheUrl(r.bookUrl)}`,
-        `Select a book to mark as read:`
-      );
+      await sendSearchResults(msg.chat.id, results.slice(0, 5),
+        (r) => `fin_ed:${cacheUrl(r.bookUrl)}`,
+        `Pick the book, then choose the edition:`);
     } catch (err) {
       logger.error('/finished error', err);
       await reply(msg.chat.id, `Search failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   });
 
-  // ── /link <title> ────────────────────────────────────────────────────────────
+  // ── /link <title> — two-step: pick book → pick edition ──────────────────────
 
   bot.onText(/^\/link (.+)/, async (msg, match) => {
     if (!isAuthorized(msg)) return;
     const query = match?.[1]?.trim();
-    if (!query) {
-      await reply(msg.chat.id, 'Usage: /link <ABS book title>');
-      return;
-    }
+    if (!query) { await reply(msg.chat.id, 'Usage: /link <ABS book title>'); return; }
 
     let absBook: AbsBookProgress | null = null;
     try {
@@ -394,12 +379,18 @@ export function createBot(options: CreateBotOptions): Bot {
         return;
       }
 
-      await sendSearchResults(
-        msg.chat.id,
-        results.slice(0, 5),
-        (r) => `link:${absId}:${cacheUrl(r.bookUrl)}`,
-        `Select the StoryGraph entry for *${absBook.title}*:`
-      );
+      // Step 1: Pick the book (deduplicated by title+author)
+      const seen = new Set<string>();
+      const deduped = results.filter((r) => {
+        const key = `${r.title}::${r.author}`.toLowerCase();
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+
+      await sendSearchResults(msg.chat.id, deduped.slice(0, 5),
+        (r) => `lk_bk:${absId}:${cacheUrl(r.bookUrl)}`,
+        `Step 1: Pick the correct book:`);
     } catch (err) {
       logger.error('/link search error', err);
       await reply(msg.chat.id, `Search failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -417,20 +408,177 @@ export function createBot(options: CreateBotOptions): Bot {
 
     await bot.answerCallbackQuery(query.id).catch(() => null);
 
+    // ── Step 2 handlers: fetch editions after book is picked ──
+
+    // lk_bk:<absId>:<urlId> → /link step 2: show editions
+    if (data.startsWith('lk_bk:')) {
+      const rest = data.slice(6);
+      const colonIdx = rest.indexOf(':');
+      if (colonIdx === -1) return;
+      const absId = rest.slice(0, colonIdx);
+      const urlId = parseInt(rest.slice(colonIdx + 1), 10);
+      const bookUrl = getCachedUrl(urlId);
+      if (!bookUrl) { await reply(cid, 'Button expired. Please search again.'); return; }
+
+      await reply(cid, `Loading editions...`);
+      try {
+        const editions = await storygraph.getEditions(bookUrl);
+        if (editions.length === 0 || (editions.length === 1 && editions[0].format === 'unknown')) {
+          // No editions page or couldn't parse — link directly to this book
+          await reply(cid, `Could not find separate editions. Linking directly...`);
+          const booksInProgress = await absClient.getItemsInProgress();
+          const absBook = booksInProgress.find((b) => b.absLibraryItemId === absId);
+          db.upsertBookMapping({
+            absLibraryItemId: absId,
+            storygraphBookUrl: bookUrl,
+            title: absBook?.title ?? absId,
+            author: absBook?.author ?? '',
+            editionType: 'audio',
+          });
+          await reply(cid, `Linked *${absBook?.title ?? absId}* to StoryGraph!\n${bookUrl}`);
+          return;
+        }
+
+        await sendEditionResults(cid, editions,
+          (e) => `lk_ed:${absId}:${cacheUrl(e.bookUrl)}`,
+          `Step 2: Pick the edition (audiobook, hardcover, etc):`);
+      } catch (err) {
+        logger.error('editions fetch error', err);
+        await reply(cid, `Failed to load editions: ${err instanceof Error ? err.message : String(err)}\n\nLinking to the main book page instead.`);
+        const booksInProgress = await absClient.getItemsInProgress();
+        const absBook = booksInProgress.find((b) => b.absLibraryItemId === absId);
+        db.upsertBookMapping({
+          absLibraryItemId: absId,
+          storygraphBookUrl: bookUrl,
+          title: absBook?.title ?? absId,
+          author: absBook?.author ?? '',
+          editionType: 'audio',
+        });
+        await reply(cid, `Linked *${absBook?.title ?? absId}* to StoryGraph!\n${bookUrl}`);
+      }
+      return;
+    }
+
+    // lk_ed:<absId>:<urlId> → /link step 3: save the specific edition
+    if (data.startsWith('lk_ed:')) {
+      const rest = data.slice(6);
+      const colonIdx = rest.indexOf(':');
+      if (colonIdx === -1) return;
+      const absId = rest.slice(0, colonIdx);
+      const urlId = parseInt(rest.slice(colonIdx + 1), 10);
+      const bookUrl = getCachedUrl(urlId);
+      if (!bookUrl) { await reply(cid, 'Button expired. Please search again.'); return; }
+
+      await reply(cid, `Linking edition...`);
+      try {
+        const booksInProgress = await absClient.getItemsInProgress();
+        const absBook = booksInProgress.find((b) => b.absLibraryItemId === absId);
+        db.upsertBookMapping({
+          absLibraryItemId: absId,
+          storygraphBookUrl: bookUrl,
+          title: absBook?.title ?? absId,
+          author: absBook?.author ?? '',
+          editionType: 'audio',
+        });
+        await reply(cid, `Linked *${absBook?.title ?? absId}* to StoryGraph edition!\n${bookUrl}`);
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        await reply(cid, `Failed to link: ${errMsg}`);
+      }
+      return;
+    }
+
+    // add_ed:<urlId> → /add step 2: show editions to add to TBR
+    if (data.startsWith('add_ed:')) {
+      const urlId = parseInt(data.slice(7), 10);
+      const bookUrl = getCachedUrl(urlId);
+      if (!bookUrl) { await reply(cid, 'Button expired. Please search again.'); return; }
+
+      await reply(cid, `Loading editions...`);
+      try {
+        const editions = await storygraph.getEditions(bookUrl);
+        if (editions.length === 0) {
+          await storygraph.addToTBR(bookUrl);
+          await reply(cid, `Added to TBR!`);
+          return;
+        }
+        await sendEditionResults(cid, editions,
+          (e) => `add:${cacheUrl(e.bookUrl)}`,
+          `Pick the edition to add to your TBR:`);
+      } catch (err) {
+        logger.error('add editions error', err);
+        await reply(cid, `Failed to load editions. Adding main book instead...`);
+        await storygraph.addToTBR(bookUrl).catch(() => null);
+        await reply(cid, `Added to TBR!`);
+      }
+      return;
+    }
+
+    // rd_ed:<urlId> → /reading step 2: show editions
+    if (data.startsWith('rd_ed:')) {
+      const urlId = parseInt(data.slice(6), 10);
+      const bookUrl = getCachedUrl(urlId);
+      if (!bookUrl) { await reply(cid, 'Button expired. Please search again.'); return; }
+
+      await reply(cid, `Loading editions...`);
+      try {
+        const editions = await storygraph.getEditions(bookUrl);
+        if (editions.length === 0) {
+          await storygraph.markAsReading(bookUrl);
+          await reply(cid, `Marked as currently reading!`);
+          return;
+        }
+        await sendEditionResults(cid, editions,
+          (e) => `reading:${cacheUrl(e.bookUrl)}`,
+          `Pick the edition to mark as currently reading:`);
+      } catch (err) {
+        logger.error('reading editions error', err);
+        await reply(cid, `Failed to load editions. Using main book page...`);
+        await storygraph.markAsReading(bookUrl).catch(() => null);
+        await reply(cid, `Marked as currently reading!`);
+      }
+      return;
+    }
+
+    // fin_ed:<urlId> → /finished step 2: show editions
+    if (data.startsWith('fin_ed:')) {
+      const urlId = parseInt(data.slice(7), 10);
+      const bookUrl = getCachedUrl(urlId);
+      if (!bookUrl) { await reply(cid, 'Button expired. Please search again.'); return; }
+
+      await reply(cid, `Loading editions...`);
+      try {
+        const editions = await storygraph.getEditions(bookUrl);
+        if (editions.length === 0) {
+          await storygraph.markAsRead(bookUrl);
+          await reply(cid, `Marked as read!`);
+          return;
+        }
+        await sendEditionResults(cid, editions,
+          (e) => `finished:${cacheUrl(e.bookUrl)}`,
+          `Pick the edition to mark as read:`);
+      } catch (err) {
+        logger.error('finished editions error', err);
+        await reply(cid, `Failed to load editions. Using main book page...`);
+        await storygraph.markAsRead(bookUrl).catch(() => null);
+        await reply(cid, `Marked as read!`);
+      }
+      return;
+    }
+
+    // ── Direct action handlers (after edition is picked) ──
+
     // add:<urlId>
     if (data.startsWith('add:')) {
       const urlId = parseInt(data.slice(4), 10);
       const bookUrl = getCachedUrl(urlId);
       if (!bookUrl) { await reply(cid, 'Button expired. Please search again.'); return; }
-      if (msgId) await editMessage(cid, msgId, `Adding to TBR...`);
+      await reply(cid, `Adding to TBR...`);
       try {
         await storygraph.addToTBR(bookUrl);
-        if (msgId) await editMessage(cid, msgId, `Added to TBR!`);
-        else await reply(cid, `Added to TBR!`);
+        await reply(cid, `Added to TBR!`);
       } catch (err) {
-        const errMsg = err instanceof Error ? err.message : String(err);
-        if (msgId) await editMessage(cid, msgId, `Failed to add to TBR: ${errMsg}`);
-        else await reply(cid, `Failed to add to TBR: ${errMsg}`);
+        await reply(cid, `Failed to add to TBR: ${err instanceof Error ? err.message : String(err)}`);
       }
       return;
     }
@@ -445,8 +593,7 @@ export function createBot(options: CreateBotOptions): Bot {
         await storygraph.markAsReading(bookUrl);
         await reply(cid, `Marked as currently reading!`);
       } catch (err) {
-        const errMsg = err instanceof Error ? err.message : String(err);
-        await reply(cid, `Failed: ${errMsg}`);
+        await reply(cid, `Failed: ${err instanceof Error ? err.message : String(err)}`);
       }
       return;
     }
@@ -461,44 +608,12 @@ export function createBot(options: CreateBotOptions): Bot {
         await storygraph.markAsRead(bookUrl);
         await reply(cid, `Marked as read!`);
       } catch (err) {
-        const errMsg = err instanceof Error ? err.message : String(err);
-        await reply(cid, `Failed: ${errMsg}`);
+        await reply(cid, `Failed: ${err instanceof Error ? err.message : String(err)}`);
       }
       return;
     }
 
-    // link:<absId>:<urlId>
-    if (data.startsWith('link:')) {
-      const rest = data.slice(5);
-      const colonIdx = rest.indexOf(':');
-      if (colonIdx === -1) return;
-      const absId = rest.slice(0, colonIdx);
-      const urlId = parseInt(rest.slice(colonIdx + 1), 10);
-      const bookUrl = getCachedUrl(urlId);
-      if (!bookUrl) { await reply(cid, 'Button expired. Please search again.'); return; }
-
-      await reply(cid, `Linking book...`);
-      try {
-        const booksInProgress = await absClient.getItemsInProgress();
-        const absBook = booksInProgress.find((b) => b.absLibraryItemId === absId);
-
-        db.upsertBookMapping({
-          absLibraryItemId: absId,
-          storygraphBookUrl: bookUrl,
-          title: absBook?.title ?? absId,
-          author: absBook?.author ?? '',
-          editionType: 'audio',
-        });
-
-        await reply(cid, `Linked *${absBook?.title ?? absId}* to StoryGraph!\n${bookUrl}`);
-      } catch (err) {
-        const errMsg = err instanceof Error ? err.message : String(err);
-        await reply(cid, `Failed to link: ${errMsg}`);
-      }
-      return;
-    }
-
-    // newbook_yes:<absId>:<urlId>
+    // nby:<absId>:<urlId> — new book auto-link
     if (data.startsWith('nby:')) {
       const rest = data.slice(4);
       const colonIdx = rest.indexOf(':');
@@ -512,7 +627,6 @@ export function createBot(options: CreateBotOptions): Bot {
       try {
         const booksInProgress = await absClient.getItemsInProgress();
         const absBook = booksInProgress.find((b) => b.absLibraryItemId === absId);
-
         db.upsertBookMapping({
           absLibraryItemId: absId,
           storygraphBookUrl: bookUrl,
@@ -520,25 +634,22 @@ export function createBot(options: CreateBotOptions): Bot {
           author: absBook?.author ?? '',
           editionType: 'audio',
         });
-
         await storygraph.markAsReading(bookUrl);
-
         await reply(cid, `Linked and marked as currently reading!\n*${absBook?.title ?? absId}*\n${bookUrl}`);
       } catch (err) {
-        const errMsg = err instanceof Error ? err.message : String(err);
-        await reply(cid, `Failed: ${errMsg}`);
+        await reply(cid, `Failed: ${err instanceof Error ? err.message : String(err)}`);
       }
       return;
     }
 
-    // newbook_skip:<absId>
+    // nbs:<absId> — skip new book
     if (data.startsWith('nbs:')) {
       await reply(cid, `Skipped. Use /link to connect this book later.`);
       return;
     }
   });
 
-  // ── Internal helpers exposed via Bot interface ────────────────────────────────
+  // ── Internal helpers ────────────────────────────────────────────────────────
 
   async function promptNewBookInternal(book: AbsBookProgress): Promise<void> {
     logger.info(`Prompting for new book: ${book.title}`);
@@ -547,36 +658,24 @@ export function createBot(options: CreateBotOptions): Bot {
       const top3 = results.slice(0, 3);
 
       if (top3.length === 0) {
-        await reply(
-          chatId,
-          `New book detected in ABS: *${book.title}* by ${book.author}\n\nNo StoryGraph results found. Use /link to connect it manually.`
-        );
+        await reply(chatId, `New book detected in ABS: *${book.title}* by ${book.author}\n\nNo StoryGraph results found. Use /link to connect it manually.`);
         return;
       }
 
       await reply(chatId, `New audiobook detected: *${book.title}* by ${book.author}\nProgress: ${book.progressPercent.toFixed(1)}%\n\nWhich StoryGraph entry matches? Selecting will link it and mark as currently reading.`);
 
-      await sendSearchResults(
-        chatId,
-        top3,
+      await sendSearchResults(chatId, top3,
         (r) => `nby:${book.absLibraryItemId}:${cacheUrl(r.bookUrl)}`,
-        ''
-      );
+        '');
 
-      // Also add a skip button as a separate message
       await reply(chatId, 'Or skip for now:', {
         reply_markup: {
-          inline_keyboard: [[
-            { text: 'Skip', callback_data: `nbs:${book.absLibraryItemId}` },
-          ]],
+          inline_keyboard: [[{ text: 'Skip', callback_data: `nbs:${book.absLibraryItemId}` }]],
         },
       });
     } catch (err) {
       logger.error('promptNewBook error', err);
-      await reply(
-        chatId,
-        `New book detected: *${book.title}* by ${book.author}\n\nFailed to search StoryGraph. Use /link to connect it manually.`
-      );
+      await reply(chatId, `New book detected: *${book.title}* by ${book.author}\n\nFailed to search StoryGraph. Use /link to connect it manually.`);
     }
   }
 
@@ -588,32 +687,17 @@ export function createBot(options: CreateBotOptions): Bot {
 
     const lines: string[] = ['*Sync Summary*', ''];
     for (const r of results) {
-      const icon = r.success ? '' : '';
       const actionLabel = r.action.replace(/_/g, ' ');
-      lines.push(`${icon} *${r.book}* — ${actionLabel}`);
-      if (!r.success && r.error) {
-        lines.push(`  _Error: ${r.error}_`);
-      }
+      lines.push(`${r.success ? '✅' : '❌'} *${r.book}* — ${actionLabel}`);
+      if (!r.success && r.error) lines.push(`  _Error: ${r.error}_`);
     }
-
     await reply(chatId, lines.join('\n'));
   }
 
   return {
-    start() {
-      logger.info('Telegram bot started (polling)');
-    },
-
-    async sendSyncSummary(results: SyncResult[]): Promise<void> {
-      await sendSyncSummaryInternal(results);
-    },
-
-    async promptNewBook(book: AbsBookProgress): Promise<void> {
-      await promptNewBookInternal(book);
-    },
-
-    async sendError(message: string): Promise<void> {
-      await reply(chatId, `Error: ${message}`);
-    },
+    start() { logger.info('Telegram bot started (polling)'); },
+    async sendSyncSummary(results: SyncResult[]) { await sendSyncSummaryInternal(results); },
+    async promptNewBook(book: AbsBookProgress) { await promptNewBookInternal(book); },
+    async sendError(message: string) { await reply(chatId, `Error: ${message}`); },
   };
 }

@@ -11,6 +11,14 @@ export interface StoryGraphSearchResult {
   coverUrl: string;
 }
 
+export interface StoryGraphEdition {
+  title: string;
+  format: string;       // e.g. "hardcover", "paperback", "audiobook", "ebook"
+  info: string;          // e.g. "305 pages • hardcover • 2017"
+  bookUrl: string;
+  coverUrl: string;
+}
+
 export interface StoryGraphBook {
   title: string;
   author: string;
@@ -21,6 +29,7 @@ export interface StoryGraph {
   login(email: string, password: string): Promise<boolean>;
   isLoggedIn(): Promise<boolean>;
   searchBooks(query: string): Promise<StoryGraphSearchResult[]>;
+  getEditions(bookUrl: string): Promise<StoryGraphEdition[]>;
   updateProgress(bookUrl: string, percent: number): Promise<void>;
   markAsReading(bookUrl: string): Promise<void>;
   markAsRead(bookUrl: string): Promise<void>;
@@ -175,6 +184,75 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
           bookUrl: r.bookUrl.startsWith('/')
             ? `https://app.thestorygraph.com${r.bookUrl}`
             : r.bookUrl,
+        }));
+      });
+    },
+
+    async getEditions(bookUrl: string): Promise<StoryGraphEdition[]> {
+      return withRetry('getEditions', async () => {
+        // Navigate to the book page first
+        logger.info(`StoryGraph getEditions: navigating to ${bookUrl}`);
+        await page.goto(bookUrl, { waitUntil: 'networkidle2', timeout: 15000 });
+
+        // Find and click the "X editions" link
+        const editionsLink = await page.$('a[href*="editions"]');
+        if (editionsLink) {
+          await editionsLink.click();
+          await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => null);
+          await sleep(2000);
+        } else {
+          // Try navigating directly to editions URL
+          const editionsUrl = bookUrl.replace(/\/?$/, '/editions');
+          logger.info(`StoryGraph getEditions: no editions link found, trying ${editionsUrl}`);
+          await page.goto(editionsUrl, { waitUntil: 'networkidle2', timeout: 15000 });
+        }
+
+        logger.info(`StoryGraph getEditions: on page ${page.url()}`);
+        await page.screenshot({ path: path.join(screenshotsDir, 'debug-editions-latest.png'), fullPage: true });
+
+        // Parse editions from the page
+        const editions = await page.evaluate(() => {
+          // Editions page likely reuses the same book card structure
+          const bookElements = document.querySelectorAll('.book-title-author-and-series');
+          if (bookElements.length > 0) {
+            return Array.from(bookElements).map((el) => {
+              const linkEl = el.querySelector('a');
+              const title = linkEl?.textContent?.trim() || '';
+              const bookUrl = linkEl?.getAttribute('href') || '';
+
+              const fullText = el.textContent || '';
+              const lines = fullText.split('\n').map(l => l.trim()).filter(Boolean);
+              const info = lines.length > 1 ? lines.slice(1).join(' • ') : '';
+
+              // Detect format from the info text
+              const lowerInfo = info.toLowerCase();
+              let format = 'unknown';
+              if (lowerInfo.includes('audio')) format = 'audiobook';
+              else if (lowerInfo.includes('ebook') || lowerInfo.includes('kindle') || lowerInfo.includes('epub')) format = 'ebook';
+              else if (lowerInfo.includes('paperback')) format = 'paperback';
+              else if (lowerInfo.includes('hardcover') || lowerInfo.includes('hardback')) format = 'hardcover';
+
+              const card = el.closest('[class*="book-pane"]')
+                || el.closest('[class*="search"]')
+                || el.parentElement?.parentElement;
+              const imgEl = card?.querySelector('img');
+              const coverUrl = imgEl?.getAttribute('src') || '';
+
+              return { title, format, info, bookUrl, coverUrl };
+            });
+          }
+
+          // Fallback: look for any list/table of editions
+          // Try to get all text content that looks like edition info
+          const allText = document.body.innerText;
+          return [{ title: 'DEBUG', format: 'unknown', info: allText.substring(0, 500), bookUrl: '', coverUrl: '' }];
+        });
+
+        return editions.map((e) => ({
+          ...e,
+          bookUrl: e.bookUrl.startsWith('/')
+            ? `https://app.thestorygraph.com${e.bookUrl}`
+            : e.bookUrl,
         }));
       });
     },
