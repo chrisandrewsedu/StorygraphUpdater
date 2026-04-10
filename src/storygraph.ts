@@ -223,42 +223,91 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
         logger.info(`StoryGraph getEditions: on page ${page.url()}`);
         await page.screenshot({ path: path.join(screenshotsDir, 'debug-editions-latest.png'), fullPage: true });
 
-        // Parse editions from the page
+        // Scroll to load all editions
+        for (let i = 0; i < 3; i++) {
+          await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+          await sleep(1000);
+        }
+
+        // Parse editions — the editions page has rich cards with "Format:", "ISBN/UID:", etc.
         const editions = await page.evaluate(() => {
-          // Editions page likely reuses the same book card structure
-          const bookElements = document.querySelectorAll('.book-title-author-and-series');
-          if (bookElements.length > 0) {
-            return Array.from(bookElements).map((el) => {
+          const results: Array<{title: string; format: string; info: string; bookUrl: string; coverUrl: string}> = [];
+
+          // Each edition card contains: cover img, title, author, "Xpages • format • year",
+          // and labeled fields like "Format: Audio", "ISBN/UID: ...", "Publisher: ..."
+          // Look for "switch to this edition" buttons to identify edition cards
+          const switchButtons = document.querySelectorAll('button, a');
+          const editionCards = new Set<Element>();
+
+          // Find all cards that contain edition info by looking for "Format:" text
+          const allElements = document.querySelectorAll('*');
+          for (const el of allElements) {
+            const text = el.textContent || '';
+            if (text.includes('Format:') && text.includes('Language:') && el.querySelector('img')) {
+              editionCards.add(el);
+            }
+          }
+
+          // If we found edition cards, parse them
+          if (editionCards.size > 0) {
+            for (const card of editionCards) {
+              const cardText = card.textContent || '';
+
+              // Extract Format
+              const formatMatch = cardText.match(/Format:\s*([\w\s]+?)(?:\n|$|ISBN)/);
+              const format = formatMatch ? formatMatch[1].trim().toLowerCase() : 'unknown';
+
+              // Extract title from bold/heading element
+              const titleEl = card.querySelector('h3, h2, .font-bold, [class*="title"]');
+              const title = titleEl?.textContent?.trim() || 'Unknown';
+
+              // Extract info line (e.g., "8h 58m • audio • 2017" or "305 pages • hardcover • 2017")
+              const infoMatch = cardText.match(/(\d+h?\s*\d*m?|\d+\s*pages)\s*•\s*\w+\s*•\s*\d{4}/);
+              const info = infoMatch ? infoMatch[0] : '';
+
+              // Extract book URL from any link in the card
+              const linkEl = card.querySelector('a[href*="/books/"]');
+              const bookUrl = linkEl?.getAttribute('href') || '';
+
+              // Cover image
+              const imgEl = card.querySelector('img');
+              const coverUrl = imgEl?.getAttribute('src') || '';
+
+              // Extract publisher
+              const pubMatch = cardText.match(/Publisher:\s*(.+?)(?:\n|$)/);
+              const publisher = pubMatch ? pubMatch[1].trim() : '';
+
+              const fullInfo = [info, publisher ? `Publisher: ${publisher}` : ''].filter(Boolean).join('\n');
+
+              results.push({ title, format, info: fullInfo, bookUrl, coverUrl });
+            }
+          }
+
+          // Fallback: try the simpler .book-title-author-and-series selector
+          if (results.length === 0) {
+            const bookElements = document.querySelectorAll('.book-title-author-and-series');
+            for (const el of bookElements) {
               const linkEl = el.querySelector('a');
               const title = linkEl?.textContent?.trim() || '';
               const bookUrl = linkEl?.getAttribute('href') || '';
-
               const fullText = el.textContent || '';
               const lines = fullText.split('\n').map(l => l.trim()).filter(Boolean);
               const info = lines.length > 1 ? lines.slice(1).join(' • ') : '';
-
-              // Detect format from the info text
               const lowerInfo = info.toLowerCase();
               let format = 'unknown';
-              if (lowerInfo.includes('audio')) format = 'audiobook';
-              else if (lowerInfo.includes('ebook') || lowerInfo.includes('kindle') || lowerInfo.includes('epub')) format = 'ebook';
+              if (lowerInfo.includes('audio')) format = 'audio';
+              else if (lowerInfo.includes('digital') || lowerInfo.includes('ebook') || lowerInfo.includes('kindle')) format = 'digital';
               else if (lowerInfo.includes('paperback')) format = 'paperback';
-              else if (lowerInfo.includes('hardcover') || lowerInfo.includes('hardback')) format = 'hardcover';
+              else if (lowerInfo.includes('hardcover')) format = 'hardcover';
 
-              const card = el.closest('[class*="book-pane"]')
-                || el.closest('[class*="search"]')
-                || el.parentElement?.parentElement;
+              const card = el.parentElement?.parentElement;
               const imgEl = card?.querySelector('img');
               const coverUrl = imgEl?.getAttribute('src') || '';
-
-              return { title, format, info, bookUrl, coverUrl };
-            });
+              results.push({ title, format, info, bookUrl, coverUrl });
+            }
           }
 
-          // Fallback: look for any list/table of editions
-          // Try to get all text content that looks like edition info
-          const allText = document.body.innerText;
-          return [{ title: 'DEBUG', format: 'unknown', info: allText.substring(0, 500), bookUrl: '', coverUrl: '' }];
+          return results;
         });
 
         return editions.map((e) => ({

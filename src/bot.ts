@@ -420,28 +420,53 @@ export function createBot(options: CreateBotOptions): Bot {
       const bookUrl = getCachedUrl(urlId);
       if (!bookUrl) { await reply(cid, 'Button expired. Please search again.'); return; }
 
-      await reply(cid, `Loading editions...`);
+      await reply(cid, `Loading editions (filtering for audiobooks)...`);
       try {
-        const editions = await storygraph.getEditions(bookUrl);
-        if (editions.length === 0 || (editions.length === 1 && editions[0].format === 'unknown')) {
-          // No editions page or couldn't parse — link directly to this book
-          await reply(cid, `Could not find separate editions. Linking directly...`);
-          const booksInProgress = await absClient.getItemsInProgress();
-          const absBook = booksInProgress.find((b) => b.absLibraryItemId === absId);
+        const allEditions = await storygraph.getEditions(bookUrl);
+        // For /link, filter to audio editions only
+        const audioEditions = allEditions.filter((e) => e.format === 'audio' || e.format === 'audiobook');
+        const booksInProgress = await absClient.getItemsInProgress();
+        const absBook = booksInProgress.find((b) => b.absLibraryItemId === absId);
+
+        if (audioEditions.length === 0) {
+          // No audio editions found — show all editions or link directly
+          if (allEditions.length === 0) {
+            await reply(cid, `No editions found. Linking directly...`);
+            db.upsertBookMapping({
+              absLibraryItemId: absId,
+              storygraphBookUrl: bookUrl,
+              title: absBook?.title ?? absId,
+              author: absBook?.author ?? '',
+              editionType: 'audio',
+            });
+            await reply(cid, `Linked *${absBook?.title ?? absId}* to StoryGraph!\n${bookUrl}`);
+          } else {
+            await reply(cid, `No audiobook editions found. Showing all ${allEditions.length} editions:`);
+            await sendEditionResults(cid, allEditions,
+              (e) => `lk_ed:${absId}:${cacheUrl(e.bookUrl)}`,
+              '');
+          }
+          return;
+        }
+
+        if (audioEditions.length === 1) {
+          // Auto-select the only audiobook edition
+          const edition = audioEditions[0];
           db.upsertBookMapping({
             absLibraryItemId: absId,
-            storygraphBookUrl: bookUrl,
+            storygraphBookUrl: edition.bookUrl || bookUrl,
             title: absBook?.title ?? absId,
             author: absBook?.author ?? '',
             editionType: 'audio',
           });
-          await reply(cid, `Linked *${absBook?.title ?? absId}* to StoryGraph!\n${bookUrl}`);
+          await reply(cid, `Found one audiobook edition — auto-linked!\n*${absBook?.title ?? absId}*\n${edition.info}\n${edition.bookUrl || bookUrl}`);
           return;
         }
 
-        await sendEditionResults(cid, editions,
+        // Multiple audio editions — let user pick
+        await sendEditionResults(cid, audioEditions,
           (e) => `lk_ed:${absId}:${cacheUrl(e.bookUrl)}`,
-          `Step 2: Pick the edition (audiobook, hardcover, etc):`);
+          `Found ${audioEditions.length} audiobook editions. Pick one:`);
       } catch (err) {
         logger.error('editions fetch error', err);
         await reply(cid, `Failed to load editions: ${err instanceof Error ? err.message : String(err)}\n\nLinking to the main book page instead.`);
