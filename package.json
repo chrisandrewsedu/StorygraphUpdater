@@ -22,6 +22,7 @@
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^25.5.2",
     "@types/node-cron": "^3.0.11",
+    "@types/node-telegram-bot-api": "^0.64.14",
     "tsx": "^4.21.0",
     "typescript": "^6.0.2",
     "vitest": "^4.1.4"
