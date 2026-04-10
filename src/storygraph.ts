@@ -370,41 +370,103 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
         await page.goto(bookUrl, { waitUntil: 'networkidle2', timeout: 15000 });
         await handleTurnstile(bookUrl);
 
-        // Click the pencil/edit icon next to the progress bar
-        // It has title="Edit your progress"
-        const editBtn = await page.$('[title="Edit your progress"], [aria-label="Edit your progress"]');
-        if (editBtn) {
-          logger.info('Found "Edit your progress" button, clicking...');
-          await editBtn.click();
-          await sleep(2000);
-        } else {
-          logger.warn('Could not find "Edit your progress" button');
-          await page.screenshot({ path: path.join(screenshotsDir, 'fail-progress-no-edit-btn.png'), fullPage: true });
-        }
+        // Scroll to top to ensure progress bar is visible
+        await page.evaluate(() => window.scrollTo(0, 0));
+        await sleep(1000);
 
-        // Take a screenshot to see what the edit form looks like
+        // Take a "before" screenshot
+        await page.screenshot({ path: path.join(screenshotsDir, 'debug-progress-before.png') });
+
+        // Click the pencil/edit icon using JavaScript (avoids "not clickable" errors)
+        const editClicked = await page.evaluate(() => {
+          // Try title attribute first
+          const byTitle = document.querySelector('[title="Edit your progress"]') as HTMLElement | null;
+          if (byTitle) { byTitle.click(); return 'clicked_by_title'; }
+
+          // Try aria-label
+          const byAria = document.querySelector('[aria-label="Edit your progress"]') as HTMLElement | null;
+          if (byAria) { byAria.click(); return 'clicked_by_aria'; }
+
+          // Try finding any pencil/edit SVG near the progress bar
+          const svgs = Array.from(document.querySelectorAll('svg'));
+          for (const svg of svgs) {
+            const parent = svg.parentElement;
+            if (parent && (parent.getAttribute('title')?.includes('progress') || parent.getAttribute('title')?.includes('Edit'))) {
+              parent.click();
+              return 'clicked_svg_parent';
+            }
+          }
+
+          // Try finding a link/button with edit-related attributes near progress
+          const allClickable = Array.from(document.querySelectorAll('a, button, [role="button"]'));
+          const editEl = allClickable.find((el) => {
+            const title = el.getAttribute('title') || '';
+            const aria = el.getAttribute('aria-label') || '';
+            return title.toLowerCase().includes('edit') && title.toLowerCase().includes('progress')
+              || aria.toLowerCase().includes('edit') && aria.toLowerCase().includes('progress');
+          });
+          if (editEl) { (editEl as HTMLElement).click(); return 'clicked_edit_el'; }
+
+          return 'not_found';
+        });
+        logger.info(`updateProgress: edit button click result: ${editClicked}`);
+        await sleep(2000);
+
+        // Take screenshot after clicking edit
         await page.screenshot({ path: path.join(screenshotsDir, 'debug-progress-edit.png'), fullPage: true });
 
-        // Look for a percentage input field
-        const percentInput = await page.$('input[type="number"], input[type="range"], input[name*="progress"], input[name*="percent"]');
-        if (percentInput) {
-          logger.info('Found progress input, setting value...');
-          await percentInput.click({ clickCount: 3 }); // Select all existing text
-          await percentInput.type(Math.round(percent).toString());
-          await sleep(500);
-        } else {
-          logger.warn('Could not find progress input field');
-          await page.screenshot({ path: path.join(screenshotsDir, 'fail-progress-no-input.png'), fullPage: true });
+        if (editClicked === 'not_found') {
+          throw new Error('Could not find "Edit your progress" button on the page');
         }
+
+        // Look for a percentage/progress input field
+        const inputFilled = await page.evaluate((pct: number) => {
+          // Try various input selectors
+          const selectors = [
+            'input[type="number"]',
+            'input[type="range"]',
+            'input[name*="progress"]',
+            'input[name*="percent"]',
+            'input[name*="percentage"]',
+          ];
+          for (const sel of selectors) {
+            const input = document.querySelector(sel) as HTMLInputElement | null;
+            if (input) {
+              input.focus();
+              input.value = '';
+              input.value = String(Math.round(pct));
+              input.dispatchEvent(new Event('input', { bubbles: true }));
+              input.dispatchEvent(new Event('change', { bubbles: true }));
+              return `filled_${sel}`;
+            }
+          }
+          return 'no_input_found';
+        }, percent);
+        logger.info(`updateProgress: input fill result: ${inputFilled}`);
+
+        if (inputFilled === 'no_input_found') {
+          await page.screenshot({ path: path.join(screenshotsDir, 'fail-progress-no-input.png'), fullPage: true });
+          throw new Error('Could not find progress input field after clicking edit');
+        }
+
+        await sleep(500);
 
         // Submit the form
-        const submitBtn = await page.$('button[type="submit"], input[type="submit"]');
-        if (submitBtn) {
-          logger.info('Submitting progress update...');
-          await submitBtn.click();
-          await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 10000 }).catch(() => null);
-        }
+        const submitted = await page.evaluate(() => {
+          const btn = document.querySelector('button[type="submit"], input[type="submit"]') as HTMLElement | null;
+          if (btn) { btn.click(); return 'submitted'; }
+          // Try any button that looks like save/update
+          const allBtns = Array.from(document.querySelectorAll('button'));
+          const saveBtn = allBtns.find((b) => {
+            const text = b.textContent?.toLowerCase() || '';
+            return text.includes('save') || text.includes('update') || text.includes('done');
+          });
+          if (saveBtn) { saveBtn.click(); return 'submitted_by_text'; }
+          return 'no_submit_found';
+        });
+        logger.info(`updateProgress: submit result: ${submitted}`);
 
+        await sleep(2000);
         await page.screenshot({ path: path.join(screenshotsDir, 'debug-progress-after.png'), fullPage: true });
         logger.info(`Updated progress for ${bookUrl} to ${percent}%`);
       });
