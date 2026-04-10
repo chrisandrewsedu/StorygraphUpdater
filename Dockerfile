@@ -1,3 +1,16 @@
+## Build stage — install all deps (including @types) and compile TypeScript
+FROM node:20-slim AS builder
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci
+
+COPY tsconfig.json ./
+COPY src/ ./src/
+RUN npx tsc
+
+## Runtime stage — only production deps + compiled JS + Chromium
 FROM node:20-slim
 
 # Install Chromium dependencies for Puppeteer
@@ -22,7 +35,6 @@ RUN apt-get update && apt-get install -y \
     --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
-# Tell Puppeteer to use the installed Chromium instead of downloading its own
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
@@ -31,11 +43,9 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
-COPY tsconfig.json ./
-COPY src/ ./src/
-RUN npx tsc
+# Copy compiled JS from builder
+COPY --from=builder /app/dist ./dist
 
-# Create data directory
 RUN mkdir -p /app/data
 
 CMD ["node", "dist/index.js"]
