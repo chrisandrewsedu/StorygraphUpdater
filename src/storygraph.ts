@@ -140,10 +140,19 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
   return {
     async login(email: string, password: string): Promise<boolean> {
       return withRetry('login', async () => {
-        await page.goto('https://app.thestorygraph.com/users/sign_in', {
-          waitUntil: 'networkidle2',
-        });
+        const loginUrl = 'https://app.thestorygraph.com/users/sign_in';
+        logger.info('StoryGraph login: navigating to sign_in page...');
+        await page.goto(loginUrl, { waitUntil: 'networkidle2' });
+        await handleTurnstile(loginUrl);
 
+        // Verify the login form is present
+        const emailInput = await page.$('input[name="user[email]"]');
+        if (!emailInput) {
+          await page.screenshot({ path: path.join(screenshotsDir, 'debug-login-form.png'), fullPage: true });
+          throw new Error('Login form not found after Turnstile');
+        }
+
+        logger.info('StoryGraph login: filling credentials...');
         await page.type('input[name="user[email]"]', email, { delay: 50 });
         await page.type('input[name="user[password]"]', password, { delay: 50 });
         await page.click('input[type="submit"], button[type="submit"]');
