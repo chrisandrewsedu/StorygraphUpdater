@@ -17,6 +17,7 @@ interface CurrentProgress {
 interface PreviousState {
   lastProgressPercent: number;
   lastAction?: string;
+  lastStatus?: string;
 }
 
 export function determineSyncActions(
@@ -29,8 +30,16 @@ export function determineSyncActions(
   }
 
   // Already marked as read — nothing to do
-  if (previous.lastAction === 'mark_read') {
+  if (previous.lastAction === 'mark_read' && previous.lastStatus === 'success') {
     return [];
+  }
+
+  // Retry if last sync failed
+  if (previous.lastStatus === 'failed') {
+    if (current.isFinished || current.progressPercent >= 99) {
+      return [{ type: 'mark_read' }];
+    }
+    return [{ type: 'progress_update', percent: current.progressPercent }];
   }
 
   // Finished or nearly finished
@@ -49,6 +58,7 @@ export function determineSyncActions(
 export interface SyncResult {
   book: string;
   action: string;
+  percent?: number;
   success: boolean;
   error?: string;
   screenshotPath?: string;
@@ -71,7 +81,7 @@ export async function runSync(
     const lastSync = mapping ? db.getLastSync(mapping.id) : null;
 
     const previous = lastSync
-      ? { lastProgressPercent: lastSync.progressPercent, lastAction: lastSync.action }
+      ? { lastProgressPercent: lastSync.progressPercent, lastAction: lastSync.action, lastStatus: lastSync.status }
       : mapping
         ? { lastProgressPercent: 0 }
         : null;
@@ -113,8 +123,8 @@ export async function runSync(
           errorMessage: null,
         });
 
-        results.push({ book: book.title, action: action.type, success: true });
-        logger.info(`Synced ${book.title}: ${action.type}`);
+        results.push({ book: book.title, action: action.type, percent: book.progressPercent, success: true });
+        logger.info(`Synced ${book.title}: ${action.type} at ${Math.round(book.progressPercent)}%`);
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);
         const screenshotPath = (err as any)?.screenshotPath;

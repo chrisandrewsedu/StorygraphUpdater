@@ -34,12 +34,20 @@ describe('determineSyncActions', () => {
     expect(actions).toEqual([{ type: 'mark_read' }]);
   });
 
-  it('should not re-mark as read if last action was already mark_read', () => {
+  it('should not re-mark as read if last action was already mark_read and succeeded', () => {
     const actions = determineSyncActions(
       { absLibraryItemId: 'li_1', progressPercent: 100, isFinished: true },
-      { lastProgressPercent: 100, lastAction: 'mark_read' }
+      { lastProgressPercent: 100, lastAction: 'mark_read', lastStatus: 'success' }
     );
     expect(actions).toEqual([]);
+  });
+
+  it('should retry if last sync failed', () => {
+    const actions = determineSyncActions(
+      { absLibraryItemId: 'li_1', progressPercent: 35, isFinished: false },
+      { lastProgressPercent: 35, lastAction: 'progress_update', lastStatus: 'failed' }
+    );
+    expect(actions).toEqual([{ type: 'progress_update', percent: 35 }]);
   });
 
   it('should queue new_book when no previous sync exists', () => {

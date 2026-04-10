@@ -768,7 +768,8 @@ export function createBot(options: CreateBotOptions): Bot {
     const lines: string[] = ['*Sync Summary*', ''];
     for (const r of results) {
       const actionLabel = r.action.replace(/_/g, ' ');
-      lines.push(`${r.success ? '✅' : '❌'} *${r.book}* — ${actionLabel}`);
+      const percentStr = r.percent != null ? ` (${Math.round(r.percent)}%)` : '';
+      lines.push(`${r.success ? '✅' : '❌'} *${r.book}* — ${actionLabel}${percentStr}`);
       if (!r.success && r.error) lines.push(`  _Error: ${r.error}_`);
     }
     await reply(chatId, lines.join('\n'));
