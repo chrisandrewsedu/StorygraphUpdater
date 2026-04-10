@@ -76,21 +76,49 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
 
   const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
-  /** Check for Cloudflare Turnstile and wait it out if present. */
+  /** Check for Cloudflare Turnstile and attempt to solve it. */
   async function handleTurnstile(url: string): Promise<void> {
-    const content = await page.content();
-    if (content.includes('security verification') || content.includes('cf-turnstile')) {
-      logger.warn(`Turnstile detected on ${url}, waiting 10s and retrying...`);
-      await sleep(10000);
-      await page.goto(url, { waitUntil: 'networkidle2', timeout: 15000 });
-      // Check again
-      const content2 = await page.content();
-      if (content2.includes('security verification') || content2.includes('cf-turnstile')) {
-        logger.warn(`Turnstile still present after retry, waiting another 15s...`);
-        await sleep(15000);
-        await page.reload({ waitUntil: 'networkidle2', timeout: 15000 });
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const content = await page.content();
+      if (!content.includes('security verification') && !content.includes('cf-turnstile')) {
+        return; // No challenge, we're good
       }
+
+      logger.warn(`Turnstile detected on ${url} (attempt ${attempt + 1}/3)`);
+
+      // Try to click the Turnstile checkbox inside its iframe
+      try {
+        const frames = page.frames();
+        for (const frame of frames) {
+          const checkbox = await frame.$('input[type="checkbox"], .cb-i, [id*="challenge"]').catch(() => null);
+          if (checkbox) {
+            logger.info('Found Turnstile checkbox, clicking...');
+            await checkbox.click();
+            await sleep(3000);
+            break;
+          }
+        }
+      } catch {
+        logger.warn('Could not interact with Turnstile iframe');
+      }
+
+      // Wait for challenge to resolve
+      await sleep(5000);
+
+      // Check if it cleared
+      const afterContent = await page.content();
+      if (!afterContent.includes('security verification') && !afterContent.includes('cf-turnstile')) {
+        logger.info('Turnstile cleared after checkbox click');
+        return;
+      }
+
+      // Reload and try again
+      logger.warn('Turnstile still present, reloading...');
+      await page.goto(url, { waitUntil: 'networkidle2', timeout: 15000 });
+      await sleep(5000);
     }
+
+    logger.error(`Turnstile could not be cleared after 3 attempts on ${url}`);
   }
 
   async function withRetry<T>(action: string, fn: () => Promise<T>): Promise<T> {
