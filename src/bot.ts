@@ -1,7 +1,7 @@
 import TelegramBot from 'node-telegram-bot-api';
 import { logger } from './logger.js';
 import type { Database } from './db.js';
-import type { StoryGraph } from './storygraph.js';
+import type { StoryGraph, StoryGraphSearchResult } from './storygraph.js';
 import type { AbsClient, AbsBookProgress } from './abs-client.js';
 import { runSync, type SyncResult } from './sync.js';
 
@@ -71,6 +71,46 @@ export function createBot(options: CreateBotOptions): Bot {
       });
     } catch (err) {
       logger.error('Failed to edit Telegram message', err);
+    }
+  }
+
+  /**
+   * Send search results as individual photo messages with a select button each.
+   * Each result shows cover image, title, author, edition info, and a button.
+   * callbackPrefix is used to construct callback_data like "link:absId:urlCacheId"
+   */
+  async function sendSearchResults(
+    chatIdTarget: string | number,
+    results: StoryGraphSearchResult[],
+    makeCallbackData: (r: StoryGraphSearchResult) => string,
+    headerText: string
+  ): Promise<void> {
+    await reply(chatIdTarget, headerText);
+
+    for (let i = 0; i < results.length; i++) {
+      const r = results[i];
+      const caption = `*${i + 1}. ${r.title}*${r.author ? `\n${r.author}` : ''}${r.editionInfo ? `\n_${r.editionInfo}_` : ''}`;
+      const keyboard: TelegramBot.InlineKeyboardButton[][] = [[
+        { text: `Select this edition`, callback_data: makeCallbackData(r) },
+      ]];
+
+      if (r.coverUrl) {
+        try {
+          await bot.sendPhoto(chatIdTarget, r.coverUrl, {
+            caption,
+            parse_mode: 'Markdown',
+            reply_markup: { inline_keyboard: keyboard },
+          });
+          continue;
+        } catch (err) {
+          logger.warn(`Failed to send cover photo for ${r.title}, falling back to text`);
+        }
+      }
+
+      // Fallback: text-only if no cover or photo send failed
+      await reply(chatIdTarget, caption, {
+        reply_markup: { inline_keyboard: keyboard },
+      });
     }
   }
 
@@ -195,21 +235,12 @@ export function createBot(options: CreateBotOptions): Bot {
         return;
       }
 
-      const top5 = results.slice(0, 5);
-      const keyboard: TelegramBot.InlineKeyboardButton[][] = top5.map((r, i) => [
-        {
-          text: `${i + 1}. ${r.title}${r.author ? ` — ${r.author}` : ''}`,
-          callback_data: `add:${cacheUrl(r.bookUrl)}`,
-        },
-      ]);
-
-      const lines = top5.map((r, i) =>
-        `${i + 1}. *${r.title}*${r.author ? ` — ${r.author}` : ''}${r.editionInfo ? `\n   _${r.editionInfo}_` : ''}`
+      await sendSearchResults(
+        msg.chat.id,
+        results.slice(0, 5),
+        (r) => `add:${cacheUrl(r.bookUrl)}`,
+        `Select a book to add to TBR:`
       );
-
-      await reply(msg.chat.id, `Select a book to add to TBR:\n\n${lines.join('\n\n')}`, {
-        reply_markup: { inline_keyboard: keyboard },
-      });
     } catch (err) {
       logger.error('/add error', err);
       await reply(msg.chat.id, `Search failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -249,7 +280,6 @@ export function createBot(options: CreateBotOptions): Bot {
         return;
       }
 
-      // Fisher-Yates shuffle and take first 3
       const shuffled = [...books];
       for (let i = shuffled.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
@@ -285,21 +315,12 @@ export function createBot(options: CreateBotOptions): Bot {
         return;
       }
 
-      const top5 = results.slice(0, 5);
-      const keyboard: TelegramBot.InlineKeyboardButton[][] = top5.map((r, i) => [
-        {
-          text: `${i + 1}. ${r.title}${r.author ? ` — ${r.author}` : ''}`,
-          callback_data: `reading:${cacheUrl(r.bookUrl)}`,
-        },
-      ]);
-
-      const lines = top5.map((r, i) =>
-        `${i + 1}. *${r.title}*${r.author ? ` — ${r.author}` : ''}${r.editionInfo ? `\n   _${r.editionInfo}_` : ''}`
+      await sendSearchResults(
+        msg.chat.id,
+        results.slice(0, 5),
+        (r) => `reading:${cacheUrl(r.bookUrl)}`,
+        `Select a book to mark as currently reading:`
       );
-
-      await reply(msg.chat.id, `Select a book to mark as currently reading:\n\n${lines.join('\n\n')}`, {
-        reply_markup: { inline_keyboard: keyboard },
-      });
     } catch (err) {
       logger.error('/reading error', err);
       await reply(msg.chat.id, `Search failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -324,21 +345,12 @@ export function createBot(options: CreateBotOptions): Bot {
         return;
       }
 
-      const top5 = results.slice(0, 5);
-      const keyboard: TelegramBot.InlineKeyboardButton[][] = top5.map((r, i) => [
-        {
-          text: `${i + 1}. ${r.title}${r.author ? ` — ${r.author}` : ''}`,
-          callback_data: `finished:${cacheUrl(r.bookUrl)}`,
-        },
-      ]);
-
-      const lines = top5.map((r, i) =>
-        `${i + 1}. *${r.title}*${r.author ? ` — ${r.author}` : ''}${r.editionInfo ? `\n   _${r.editionInfo}_` : ''}`
+      await sendSearchResults(
+        msg.chat.id,
+        results.slice(0, 5),
+        (r) => `finished:${cacheUrl(r.bookUrl)}`,
+        `Select a book to mark as read:`
       );
-
-      await reply(msg.chat.id, `Select a book to mark as read:\n\n${lines.join('\n\n')}`, {
-        reply_markup: { inline_keyboard: keyboard },
-      });
     } catch (err) {
       logger.error('/finished error', err);
       await reply(msg.chat.id, `Search failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -355,7 +367,6 @@ export function createBot(options: CreateBotOptions): Bot {
       return;
     }
 
-    // Find the ABS book by fuzzy title match
     let absBook: AbsBookProgress | null = null;
     try {
       const booksInProgress = await absClient.getItemsInProgress();
@@ -383,22 +394,11 @@ export function createBot(options: CreateBotOptions): Bot {
         return;
       }
 
-      const top5 = results.slice(0, 5);
-      const keyboard: TelegramBot.InlineKeyboardButton[][] = top5.map((r, i) => [
-        {
-          text: `${i + 1}. ${r.title}${r.author ? ` — ${r.author}` : ''}`,
-          callback_data: `link:${absId}:${cacheUrl(r.bookUrl)}`,
-        },
-      ]);
-
-      const lines = top5.map((r, i) =>
-        `${i + 1}. *${r.title}*${r.author ? ` — ${r.author}` : ''}${r.editionInfo ? `\n   _${r.editionInfo}_` : ''}`
-      );
-
-      await reply(
+      await sendSearchResults(
         msg.chat.id,
-        `Select the StoryGraph entry for *${absBook.title}*:\n\n${lines.join('\n\n')}`,
-        { reply_markup: { inline_keyboard: keyboard } }
+        results.slice(0, 5),
+        (r) => `link:${absId}:${cacheUrl(r.bookUrl)}`,
+        `Select the StoryGraph entry for *${absBook.title}*:`
       );
     } catch (err) {
       logger.error('/link search error', err);
@@ -440,15 +440,13 @@ export function createBot(options: CreateBotOptions): Bot {
       const urlId = parseInt(data.slice(8), 10);
       const bookUrl = getCachedUrl(urlId);
       if (!bookUrl) { await reply(cid, 'Button expired. Please search again.'); return; }
-      if (msgId) await editMessage(cid, msgId, `Marking as currently reading...`);
+      await reply(cid, `Marking as currently reading...`);
       try {
         await storygraph.markAsReading(bookUrl);
-        if (msgId) await editMessage(cid, msgId, `Marked as currently reading!`);
-        else await reply(cid, `Marked as currently reading!`);
+        await reply(cid, `Marked as currently reading!`);
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
-        if (msgId) await editMessage(cid, msgId, `Failed: ${errMsg}`);
-        else await reply(cid, `Failed: ${errMsg}`);
+        await reply(cid, `Failed: ${errMsg}`);
       }
       return;
     }
@@ -458,15 +456,13 @@ export function createBot(options: CreateBotOptions): Bot {
       const urlId = parseInt(data.slice(9), 10);
       const bookUrl = getCachedUrl(urlId);
       if (!bookUrl) { await reply(cid, 'Button expired. Please search again.'); return; }
-      if (msgId) await editMessage(cid, msgId, `Marking as read...`);
+      await reply(cid, `Marking as read...`);
       try {
         await storygraph.markAsRead(bookUrl);
-        if (msgId) await editMessage(cid, msgId, `Marked as read!`);
-        else await reply(cid, `Marked as read!`);
+        await reply(cid, `Marked as read!`);
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
-        if (msgId) await editMessage(cid, msgId, `Failed: ${errMsg}`);
-        else await reply(cid, `Failed: ${errMsg}`);
+        await reply(cid, `Failed: ${errMsg}`);
       }
       return;
     }
@@ -481,7 +477,7 @@ export function createBot(options: CreateBotOptions): Bot {
       const bookUrl = getCachedUrl(urlId);
       if (!bookUrl) { await reply(cid, 'Button expired. Please search again.'); return; }
 
-      if (msgId) await editMessage(cid, msgId, `Linking book...`);
+      await reply(cid, `Linking book...`);
       try {
         const booksInProgress = await absClient.getItemsInProgress();
         const absBook = booksInProgress.find((b) => b.absLibraryItemId === absId);
@@ -494,13 +490,10 @@ export function createBot(options: CreateBotOptions): Bot {
           editionType: 'audio',
         });
 
-        const text = `Linked *${absBook?.title ?? absId}* to StoryGraph!\n${bookUrl}`;
-        if (msgId) await editMessage(cid, msgId, text);
-        else await reply(cid, text);
+        await reply(cid, `Linked *${absBook?.title ?? absId}* to StoryGraph!\n${bookUrl}`);
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
-        if (msgId) await editMessage(cid, msgId, `Failed to link: ${errMsg}`);
-        else await reply(cid, `Failed to link: ${errMsg}`);
+        await reply(cid, `Failed to link: ${errMsg}`);
       }
       return;
     }
@@ -515,7 +508,7 @@ export function createBot(options: CreateBotOptions): Bot {
       const bookUrl = getCachedUrl(urlId);
       if (!bookUrl) { await reply(cid, 'Button expired. Please search again.'); return; }
 
-      if (msgId) await editMessage(cid, msgId, `Setting up mapping...`);
+      await reply(cid, `Setting up mapping...`);
       try {
         const booksInProgress = await absClient.getItemsInProgress();
         const absBook = booksInProgress.find((b) => b.absLibraryItemId === absId);
@@ -530,23 +523,17 @@ export function createBot(options: CreateBotOptions): Bot {
 
         await storygraph.markAsReading(bookUrl);
 
-        const text = `Linked and marked as currently reading!\n*${absBook?.title ?? absId}*\n${bookUrl}`;
-        if (msgId) await editMessage(cid, msgId, text);
-        else await reply(cid, text);
+        await reply(cid, `Linked and marked as currently reading!\n*${absBook?.title ?? absId}*\n${bookUrl}`);
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
-        if (msgId) await editMessage(cid, msgId, `Failed: ${errMsg}`);
-        else await reply(cid, `Failed: ${errMsg}`);
+        await reply(cid, `Failed: ${errMsg}`);
       }
       return;
     }
 
     // newbook_skip:<absId>
     if (data.startsWith('nbs:')) {
-      const absId = data.slice(4);
-      const text = `Skipped. Use /link to connect this book later.`;
-      if (msgId) await editMessage(cid, msgId, text);
-      else await reply(cid, text);
+      await reply(cid, `Skipped. Use /link to connect this book later.`);
       return;
     }
   });
@@ -567,37 +554,23 @@ export function createBot(options: CreateBotOptions): Bot {
         return;
       }
 
-      const lines = top3.map((r, i) =>
-        `${i + 1}. *${r.title}*${r.author ? ` — ${r.author}` : ''}${r.editionInfo ? `\n   _${r.editionInfo}_` : ''}`
-      );
+      await reply(chatId, `New audiobook detected: *${book.title}* by ${book.author}\nProgress: ${book.progressPercent.toFixed(1)}%\n\nWhich StoryGraph entry matches? Selecting will link it and mark as currently reading.`);
 
-      const keyboard: TelegramBot.InlineKeyboardButton[][] = [
-        ...top3.map((r, i) => [
-          {
-            text: `${i + 1}. ${r.title}${r.author ? ` — ${r.author}` : ''}`,
-            callback_data: `nby:${book.absLibraryItemId}:${cacheUrl(r.bookUrl)}`,
-          },
-        ]),
-        [
-          {
-            text: 'Skip for now',
-            callback_data: `nbs:${book.absLibraryItemId}`,
-          },
-        ],
-      ];
-
-      await reply(
+      await sendSearchResults(
         chatId,
-        [
-          `New audiobook detected: *${book.title}* by ${book.author}`,
-          `Progress: ${book.progressPercent.toFixed(1)}%`,
-          '',
-          'Which StoryGraph entry matches? Selecting will link it and mark as currently reading.',
-          '',
-          ...lines,
-        ].join('\n'),
-        { reply_markup: { inline_keyboard: keyboard } }
+        top3,
+        (r) => `nby:${book.absLibraryItemId}:${cacheUrl(r.bookUrl)}`,
+        ''
       );
+
+      // Also add a skip button as a separate message
+      await reply(chatId, 'Or skip for now:', {
+        reply_markup: {
+          inline_keyboard: [[
+            { text: 'Skip', callback_data: `nbs:${book.absLibraryItemId}` },
+          ]],
+        },
+      });
     } catch (err) {
       logger.error('promptNewBook error', err);
       await reply(

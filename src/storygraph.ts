@@ -8,6 +8,7 @@ export interface StoryGraphSearchResult {
   author: string;
   bookUrl: string;
   editionInfo: string;
+  coverUrl: string;
 }
 
 export interface StoryGraphBook {
@@ -142,25 +143,29 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
         await page.screenshot({ path: path.join(screenshotsDir, 'debug-search-latest.png'), fullPage: true });
 
         const results = await page.evaluate(() => {
-          // Each search result card contains the book info
-          // Structure: cover image | book-title-author-and-series (title link, author, page info) | buttons
+          // Each search result is a card with: cover image | book-title-author-and-series | buttons
+          // We look at the parent card to find the cover image too
           const bookElements = document.querySelectorAll('.book-title-author-and-series');
           return Array.from(bookElements).slice(0, 10).map((el) => {
             const linkEl = el.querySelector('a');
             const title = linkEl?.textContent?.trim() || '';
             const bookUrl = linkEl?.getAttribute('href') || '';
 
-            // Author is plain text after the title link, before page/format info
-            // Get all text, remove the title, then the first remaining line is the author
+            // Author and edition info from text lines
             const fullText = el.textContent || '';
             const lines = fullText.split('\n').map(l => l.trim()).filter(Boolean);
             // lines[0] is title, lines[1] is author, lines[2+] is page count/format/editions
             const author = lines.length > 1 ? lines[1] : '';
-
-            // Edition info: "305 pages • hardcover • 2017 > • 111 editions"
             const editionInfo = lines.length > 2 ? lines[2] : '';
 
-            return { title, author, bookUrl, editionInfo };
+            // Cover image: find the img in the parent card/row
+            const card = el.closest('[class*="book-pane"]')
+              || el.closest('[class*="search"]')
+              || el.parentElement?.parentElement;
+            const imgEl = card?.querySelector('img');
+            const coverUrl = imgEl?.getAttribute('src') || '';
+
+            return { title, author, bookUrl, editionInfo, coverUrl };
           });
         });
 
