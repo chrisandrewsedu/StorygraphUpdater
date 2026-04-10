@@ -1,0 +1,17 @@
+services:
+  storygraph-updater:
+    build: .
+    container_name: storygraph-updater
+    volumes:
+      - ./data:/app/data
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - ABS_URL=${ABS_URL}
+      - ABS_API_TOKEN=${ABS_API_TOKEN}
+      - SYNC_CRON=${SYNC_CRON:-0 22 * * *}
+      - STORYGRAPH_EMAIL=${STORYGRAPH_EMAIL:-}
+      - STORYGRAPH_PASSWORD=${STORYGRAPH_PASSWORD:-}
+      - STORYGRAPH_USERNAME=${STORYGRAPH_USERNAME:-chrisandrews}
+      - DATA_DIR=/app/data
+    restart: unless-stopped
