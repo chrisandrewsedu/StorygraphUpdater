@@ -378,34 +378,32 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
         await page.screenshot({ path: path.join(screenshotsDir, 'debug-progress-before.png') });
 
         // Click the pencil/edit icon using JavaScript (avoids "not clickable" errors)
+        // The edit button is an SVG with role="button" containing a pencil path, near the progress bar
         const editClicked = await page.evaluate(() => {
-          // Try title attribute first
+          // Method 1: SVG with role="button" that has the pencil edit path
+          const pencilSvg = document.querySelector('svg[role="button"]') as SVGElement | null;
+          if (pencilSvg) {
+            pencilSvg.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            return 'clicked_pencil_svg';
+          }
+
+          // Method 2: title attribute
           const byTitle = document.querySelector('[title="Edit your progress"]') as HTMLElement | null;
           if (byTitle) { byTitle.click(); return 'clicked_by_title'; }
 
-          // Try aria-label
+          // Method 3: aria-label
           const byAria = document.querySelector('[aria-label="Edit your progress"]') as HTMLElement | null;
           if (byAria) { byAria.click(); return 'clicked_by_aria'; }
 
-          // Try finding any pencil/edit SVG near the progress bar
-          const svgs = Array.from(document.querySelectorAll('svg'));
-          for (const svg of svgs) {
-            const parent = svg.parentElement;
-            if (parent && (parent.getAttribute('title')?.includes('progress') || parent.getAttribute('title')?.includes('Edit'))) {
-              parent.click();
-              return 'clicked_svg_parent';
+          // Method 4: any element with role="button" near progress text
+          const allRoleBtns = Array.from(document.querySelectorAll('[role="button"]'));
+          for (const el of allRoleBtns) {
+            const nearby = el.parentElement?.textContent || '';
+            if (nearby.includes('%')) {
+              (el as HTMLElement).click();
+              return 'clicked_role_btn_near_percent';
             }
           }
-
-          // Try finding a link/button with edit-related attributes near progress
-          const allClickable = Array.from(document.querySelectorAll('a, button, [role="button"]'));
-          const editEl = allClickable.find((el) => {
-            const title = el.getAttribute('title') || '';
-            const aria = el.getAttribute('aria-label') || '';
-            return title.toLowerCase().includes('edit') && title.toLowerCase().includes('progress')
-              || aria.toLowerCase().includes('edit') && aria.toLowerCase().includes('progress');
-          });
-          if (editEl) { (editEl as HTMLElement).click(); return 'clicked_edit_el'; }
 
           return 'not_found';
         });
