@@ -166,7 +166,15 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
           waitUntil: 'networkidle2',
           timeout: 15000,
         });
-        return !page.url().includes('/sign_in');
+        await handleTurnstile('https://app.thestorygraph.com/');
+        // Check for "Sign in" link in the page — if present, we're NOT logged in
+        const hasSignIn = await page.evaluate(() => {
+          const links = Array.from(document.querySelectorAll('a'));
+          return links.some((a) => a.textContent?.trim().toLowerCase() === 'sign in');
+        });
+        const loggedIn = !hasSignIn && !page.url().includes('/sign_in');
+        logger.info(`isLoggedIn check: ${loggedIn ? 'yes' : 'no'}`);
+        return loggedIn;
       } catch {
         return false;
       }
