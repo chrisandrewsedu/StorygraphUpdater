@@ -76,6 +76,23 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
 
   const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
+  /** Check for Cloudflare Turnstile and wait it out if present. */
+  async function handleTurnstile(url: string): Promise<void> {
+    const content = await page.content();
+    if (content.includes('security verification') || content.includes('cf-turnstile')) {
+      logger.warn(`Turnstile detected on ${url}, waiting 10s and retrying...`);
+      await sleep(10000);
+      await page.goto(url, { waitUntil: 'networkidle2', timeout: 15000 });
+      // Check again
+      const content2 = await page.content();
+      if (content2.includes('security verification') || content2.includes('cf-turnstile')) {
+        logger.warn(`Turnstile still present after retry, waiting another 15s...`);
+        await sleep(15000);
+        await page.reload({ waitUntil: 'networkidle2', timeout: 15000 });
+      }
+    }
+  }
+
   async function withRetry<T>(action: string, fn: () => Promise<T>): Promise<T> {
     try {
       return await fn();
@@ -134,15 +151,7 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
         await page.goto(searchUrl, { waitUntil: 'networkidle2', timeout: 15000 });
         logger.info(`StoryGraph search: page loaded, URL is ${page.url()}`);
 
-        // Check if we hit a Turnstile/challenge page
-        const pageContent = await page.content();
-        if (pageContent.includes('security verification') || pageContent.includes('cf-turnstile')) {
-          logger.warn('StoryGraph search: hit Cloudflare Turnstile challenge, waiting 10s...');
-          await sleep(10000);
-          // Reload and try again
-          await page.goto(searchUrl, { waitUntil: 'networkidle2', timeout: 15000 });
-          logger.info(`StoryGraph search: reloaded after Turnstile, URL is ${page.url()}`);
-        }
+        await handleTurnstile(searchUrl);
 
         // Wait for results to load
         const found = await page.waitForSelector('.book-title-author-and-series', { timeout: 10000 }).catch(() => null);
@@ -193,18 +202,22 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
         // Navigate to the book page first
         logger.info(`StoryGraph getEditions: navigating to ${bookUrl}`);
         await page.goto(bookUrl, { waitUntil: 'networkidle2', timeout: 15000 });
+        await handleTurnstile(bookUrl);
 
         // Find and click the "X editions" link
         const editionsLink = await page.$('a[href*="editions"]');
         if (editionsLink) {
+          logger.info('StoryGraph getEditions: found editions link, clicking...');
           await editionsLink.click();
           await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => null);
           await sleep(2000);
+          await handleTurnstile(page.url());
         } else {
           // Try navigating directly to editions URL
           const editionsUrl = bookUrl.replace(/\/?$/, '/editions');
           logger.info(`StoryGraph getEditions: no editions link found, trying ${editionsUrl}`);
           await page.goto(editionsUrl, { waitUntil: 'networkidle2', timeout: 15000 });
+          await handleTurnstile(editionsUrl);
         }
 
         logger.info(`StoryGraph getEditions: on page ${page.url()}`);
