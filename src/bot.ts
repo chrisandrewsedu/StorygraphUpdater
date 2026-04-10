@@ -227,7 +227,7 @@ export function createBot(options: CreateBotOptions): Bot {
       const results = await storygraph.searchBooks(query);
       if (results.length === 0) { await reply(msg.chat.id, 'No results found.'); return; }
 
-      const lines = results.slice(0, 5).map((r, i) =>
+      const lines = results.slice(0, 3).map((r, i) =>
         `${i + 1}. *${r.title}*${r.author ? ` — ${r.author}` : ''}${r.editionInfo ? `\n   _${r.editionInfo}_` : ''}\n   ${r.bookUrl}`
       );
       await reply(msg.chat.id, lines.join('\n\n'));
@@ -250,7 +250,7 @@ export function createBot(options: CreateBotOptions): Bot {
       if (results.length === 0) { await reply(msg.chat.id, 'No results found.'); return; }
 
       // For /add, show books then let user pick → then show editions
-      await sendSearchResults(msg.chat.id, results.slice(0, 5),
+      await sendSearchResults(msg.chat.id, results.slice(0, 3),
         (r) => `add_ed:${cacheUrl(r.bookUrl)}`,
         `Pick the book, then choose the edition to add:`);
     } catch (err) {
@@ -315,7 +315,7 @@ export function createBot(options: CreateBotOptions): Bot {
       const results = await storygraph.searchBooks(query);
       if (results.length === 0) { await reply(msg.chat.id, 'No results found.'); return; }
 
-      await sendSearchResults(msg.chat.id, results.slice(0, 5),
+      await sendSearchResults(msg.chat.id, results.slice(0, 3),
         (r) => `rd_ed:${cacheUrl(r.bookUrl)}`,
         `Pick the book, then choose the edition:`);
     } catch (err) {
@@ -336,7 +336,7 @@ export function createBot(options: CreateBotOptions): Bot {
       const results = await storygraph.searchBooks(query);
       if (results.length === 0) { await reply(msg.chat.id, 'No results found.'); return; }
 
-      await sendSearchResults(msg.chat.id, results.slice(0, 5),
+      await sendSearchResults(msg.chat.id, results.slice(0, 3),
         (r) => `fin_ed:${cacheUrl(r.bookUrl)}`,
         `Pick the book, then choose the edition:`);
     } catch (err) {
@@ -388,7 +388,7 @@ export function createBot(options: CreateBotOptions): Bot {
         return true;
       });
 
-      await sendSearchResults(msg.chat.id, deduped.slice(0, 5),
+      await sendSearchResults(msg.chat.id, deduped.slice(0, 3),
         (r) => `lk_bk:${absId}:${cacheUrl(r.bookUrl)}`,
         `Step 1: Pick the correct book:`);
     } catch (err) {
