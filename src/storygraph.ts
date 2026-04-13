@@ -397,20 +397,20 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
         await sleep(500);
         await page.screenshot({ path: path.join(screenshotsDir, 'debug-progress-edit.png'), fullPage: true });
 
-        // Submit directly via fetch() using the form's own CSRF token and fields.
-        // This bypasses the unreliable UI click chain (Rails UJS data-remote forms
-        // don't fire reliably when triggered via JS dispatchEvent).
+        // Submit directly via fetch() bypassing the unreliable Rails UJS click chain.
+        // The /update-progress form has no authenticity_token input — it uses the
+        // meta[name="csrf-token"] value passed as the X-CSRF-Token request header.
         const fetchResult = await page.evaluate(async (pct: number) => {
           const form = document.querySelector('form[action="/update-progress"]') as HTMLFormElement | null;
           if (!form) return { ok: false, error: 'form not found' };
 
-          const token = (form.querySelector('input[name="authenticity_token"]') as HTMLInputElement | null)?.value;
+          // CSRF token is in <meta name="csrf-token"> not in the form inputs
+          const token = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content');
           const bookId = (form.querySelector('input[name="book_id"]') as HTMLInputElement | null)?.value;
-          if (!token) return { ok: false, error: 'no CSRF token' };
+          if (!token) return { ok: false, error: 'no CSRF token in meta tag' };
           if (!bookId) return { ok: false, error: 'no book_id' };
 
           const body = new URLSearchParams({
-            'authenticity_token': token,
             'book_id': bookId,
             'on_book_page': 'true',
             'read_status[progress_number]': String(Math.round(pct)),
@@ -423,13 +423,15 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
               method: 'POST',
               headers: {
                 'Content-Type': 'application/x-www-form-urlencoded',
+                'X-CSRF-Token': token,
                 'X-Requested-With': 'XMLHttpRequest',
                 'Accept': 'text/javascript, application/javascript',
               },
               body: body.toString(),
               credentials: 'include',
             });
-            return { ok: res.ok, status: res.status };
+            const text = await res.text();
+            return { ok: res.ok, status: res.status, body: text.slice(0, 200) };
           } catch (e: any) {
             return { ok: false, error: e.message };
           }
