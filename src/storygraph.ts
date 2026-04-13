@@ -370,111 +370,96 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
         await page.goto(bookUrl, { waitUntil: 'networkidle2', timeout: 15000 });
         await handleTurnstile(bookUrl);
 
-        // Verify we're actually on the book page (not redirected)
+        // Verify we're on the book page
         const currentUrl = page.url();
-        logger.info(`updateProgress: current URL after navigation: ${currentUrl}`);
+        logger.info(`updateProgress: current URL: ${currentUrl}`);
         if (!currentUrl.includes('/books/')) {
           throw new Error(`Navigation landed on wrong page: ${currentUrl}`);
         }
 
-        // Scroll to top to ensure progress bar is visible
         await page.evaluate(() => window.scrollTo(0, 0));
         await sleep(1000);
-
-        // Take a "before" screenshot
         await page.screenshot({ path: path.join(screenshotsDir, 'debug-progress-before.png') });
 
-        // Click the pencil/edit icon.
-        // IMPORTANT: Must use the specific .progress-tracker-pane selector — the generic
-        // svg[role="button"] matches other SVGs on the page and causes wrong-element clicks.
+        // Step 1: Click the "Track progress" button to reveal the form.
+        // This button has a stable class: .track-progress-button
         const editClicked = await page.evaluate(() => {
-          // Primary: pencil button specifically inside the progress tracker pane
-          const trackerBtn = document.querySelector('.progress-tracker-pane button') as HTMLElement | null;
-          if (trackerBtn) {
-            trackerBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-            return 'clicked_tracker_pane_button';
+          const btn = document.querySelector('.track-progress-button') as HTMLElement | null;
+          if (btn) {
+            btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            return 'clicked_track_progress_button';
           }
-
-          // Fallback 1: title attribute
-          const byTitle = document.querySelector('[title="Edit your progress"]') as HTMLElement | null;
-          if (byTitle) { byTitle.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); return 'clicked_by_title'; }
-
-          // Fallback 2: aria-label
-          const byAria = document.querySelector('[aria-label="Edit your progress"]') as HTMLElement | null;
-          if (byAria) { byAria.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true })); return 'clicked_by_aria'; }
-
           return 'not_found';
         });
-        logger.info(`updateProgress: edit button click result: ${editClicked}`);
+        logger.info(`updateProgress: open form result: ${editClicked}`);
 
         if (editClicked === 'not_found') {
           await page.screenshot({ path: path.join(screenshotsDir, 'fail-progress-no-button.png'), fullPage: true });
-          throw new Error('Could not find progress edit button in .progress-tracker-pane');
+          throw new Error('Could not find .track-progress-button on the page');
         }
 
-        // Wait for the progress input form to appear (it's revealed inline after clicking)
-        const inputEl = await page.waitForSelector(
-          '.progress-tracker-pane input[type="number"], .progress-tracker-pane input[type="range"], .progress-tracker-pane input[name*="percent"]',
-          { timeout: 8000 }
-        ).catch(() => null);
-
-        // Take screenshot after clicking edit — shows whether form appeared
+        // Wait for the progress-tracking-form to become visible
+        await page.waitForSelector('.progress-tracking-form', { timeout: 8000 }).catch(() => null);
+        await sleep(500);
         await page.screenshot({ path: path.join(screenshotsDir, 'debug-progress-edit.png'), fullPage: true });
 
-        if (!inputEl) {
-          // Check if we navigated away from the book page
-          const urlAfterClick = page.url();
-          logger.warn(`updateProgress: no input found, current URL: ${urlAfterClick}`);
-          throw new Error('Progress input form did not appear after clicking edit button');
+        // Step 2: Fill the percentage input.
+        // The form has two inputs: progress_minutes (text, visible by default) and
+        // progress_number (number, hidden by default). We set the number input directly.
+        // The Save button is input[type="submit"].progress-tracker-update-button.
+        const fillResult = await page.evaluate((pct: number) => {
+          const numberInput = document.querySelector(
+            'input[name="read_status[progress_number]"]'
+          ) as HTMLInputElement | null;
+          if (!numberInput) return 'no_number_input';
+
+          // Clear the minutes input so only the number input has a value
+          const minutesInput = document.querySelector(
+            'input[name="read_status[progress_minutes]"]'
+          ) as HTMLInputElement | null;
+          if (minutesInput) minutesInput.value = '';
+
+          // Remove "hidden" class so Stimulus picks it up as the active field
+          numberInput.classList.remove('hidden');
+          numberInput.value = String(Math.round(pct));
+          numberInput.dispatchEvent(new Event('input', { bubbles: true }));
+          numberInput.dispatchEvent(new Event('change', { bubbles: true }));
+
+          return `filled_${Math.round(pct)}`;
+        }, percent);
+        logger.info(`updateProgress: fill result: ${fillResult}`);
+
+        if (fillResult === 'no_number_input') {
+          await page.screenshot({ path: path.join(screenshotsDir, 'fail-progress-no-input.png'), fullPage: true });
+          throw new Error('Could not find read_status[progress_number] input');
         }
 
-        // Clear and fill the input using native input value setter (works with React/Stimulus)
-        const inputFilled = await page.evaluate((pct: number) => {
-          const input = document.querySelector(
-            '.progress-tracker-pane input[type="number"], .progress-tracker-pane input[type="range"], .progress-tracker-pane input[name*="percent"]'
-          ) as HTMLInputElement | null;
-          if (!input) return 'no_input_found';
+        await sleep(300);
 
-          // Use native input setter to trigger framework reactivity
-          const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-          if (nativeInputValueSetter) {
-            nativeInputValueSetter.call(input, String(Math.round(pct)));
-          } else {
-            input.value = String(Math.round(pct));
-          }
-          input.dispatchEvent(new Event('input', { bubbles: true }));
-          input.dispatchEvent(new Event('change', { bubbles: true }));
-          return `filled_input_value_${Math.round(pct)}`;
-        }, percent);
-        logger.info(`updateProgress: input fill result: ${inputFilled}`);
-
-        await sleep(500);
-
-        // Submit — look for the submit button scoped to the progress tracker pane first
+        // Step 3: Click the Save button — it's input[type="submit"] with class progress-tracker-update-button.
+        // Do NOT use button[type="submit"] which matches "Mark as finished".
         const submitted = await page.evaluate(() => {
-          // First look inside the progress tracker pane
-          const pane = document.querySelector('.progress-tracker-pane');
-          if (pane) {
-            const paneSubmit = pane.querySelector('button[type="submit"], input[type="submit"]') as HTMLElement | null;
-            if (paneSubmit) { paneSubmit.click(); return 'submitted_pane_submit'; }
+          const saveBtn = document.querySelector(
+            'input[type="submit"].progress-tracker-update-button'
+          ) as HTMLElement | null;
+          if (saveBtn) { saveBtn.click(); return 'submitted_save'; }
 
-            const paneBtns = Array.from(pane.querySelectorAll('button'));
-            const saveBtn = paneBtns.find((b) => {
-              const text = b.textContent?.toLowerCase() || '';
-              return text.includes('save') || text.includes('update') || text.includes('done') || text.includes('set');
-            });
-            if (saveBtn) { saveBtn.click(); return `submitted_pane_btn: ${saveBtn.textContent?.trim()}`; }
-          }
-
-          // Global fallback
-          const globalSubmit = document.querySelector('button[type="submit"], input[type="submit"]') as HTMLElement | null;
-          if (globalSubmit) { globalSubmit.click(); return 'submitted_global'; }
+          // Fallback: input[type="submit"][value="Save"]
+          const saveByValue = document.querySelector(
+            'input[type="submit"][value="Save"]'
+          ) as HTMLElement | null;
+          if (saveByValue) { saveByValue.click(); return 'submitted_save_by_value'; }
 
           return 'no_submit_found';
         });
         logger.info(`updateProgress: submit result: ${submitted}`);
 
-        // Wait for the form to close / page to update
+        if (submitted === 'no_submit_found') {
+          await page.screenshot({ path: path.join(screenshotsDir, 'fail-progress-no-submit.png'), fullPage: true });
+          throw new Error('Could not find Save submit button');
+        }
+
+        // Wait for the AJAX form submission to complete
         await sleep(3000);
         await page.screenshot({ path: path.join(screenshotsDir, 'debug-progress-after.png'), fullPage: true });
         logger.info(`Updated progress for ${bookUrl} to ${percent}%`);
