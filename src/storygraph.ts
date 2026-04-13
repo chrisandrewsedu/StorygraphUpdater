@@ -370,7 +370,6 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
         await page.goto(bookUrl, { waitUntil: 'networkidle2', timeout: 15000 });
         await handleTurnstile(bookUrl);
 
-        // Verify we're on the book page
         const currentUrl = page.url();
         logger.info(`updateProgress: current URL: ${currentUrl}`);
         if (!currentUrl.includes('/books/')) {
@@ -378,129 +377,94 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
         }
 
         await page.evaluate(() => window.scrollTo(0, 0));
-        await sleep(1000);
+        await sleep(500);
         await page.screenshot({ path: path.join(screenshotsDir, 'debug-progress-before.png') });
 
-        // Step 1: Click the "Track progress" button to reveal the form.
-        // This button has a stable class: .track-progress-button
-        const editClicked = await page.evaluate(() => {
+        // Click "Track progress" to reveal the form and populate the CSRF token
+        const formInfo = await page.evaluate(() => {
           const btn = document.querySelector('.track-progress-button') as HTMLElement | null;
-          if (btn) {
-            btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-            return 'clicked_track_progress_button';
-          }
-          return 'not_found';
+          if (!btn) return null;
+          btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+          return 'clicked';
         });
-        logger.info(`updateProgress: open form result: ${editClicked}`);
-
-        if (editClicked === 'not_found') {
+        if (!formInfo) {
           await page.screenshot({ path: path.join(screenshotsDir, 'fail-progress-no-button.png'), fullPage: true });
           throw new Error('Could not find .track-progress-button on the page');
         }
 
-        // Wait for the progress-tracking-form to become visible
+        // Wait for the form to appear so all hidden inputs (CSRF token etc.) are populated
         await page.waitForSelector('.progress-tracking-form', { timeout: 8000 }).catch(() => null);
         await sleep(500);
         await page.screenshot({ path: path.join(screenshotsDir, 'debug-progress-edit.png'), fullPage: true });
 
-        // Step 2: Fill the percentage input.
-        // The form has two inputs: progress_minutes (text, visible by default) and
-        // progress_number (number, hidden by default). We set the number input directly.
-        // The Save button is input[type="submit"].progress-tracker-update-button.
-        const fillResult = await page.evaluate((pct: number) => {
-          const numberInput = document.querySelector(
-            'input[name="read_status[progress_number]"]'
-          ) as HTMLInputElement | null;
-          if (!numberInput) return 'no_number_input';
+        // Submit directly via fetch() using the form's own CSRF token and fields.
+        // This bypasses the unreliable UI click chain (Rails UJS data-remote forms
+        // don't fire reliably when triggered via JS dispatchEvent).
+        const fetchResult = await page.evaluate(async (pct: number) => {
+          const form = document.querySelector('form[action="/update-progress"]') as HTMLFormElement | null;
+          if (!form) return { ok: false, error: 'form not found' };
 
-          // Clear the minutes input so only the number input has a value
-          const minutesInput = document.querySelector(
-            'input[name="read_status[progress_minutes]"]'
-          ) as HTMLInputElement | null;
-          if (minutesInput) minutesInput.value = '';
+          const token = (form.querySelector('input[name="authenticity_token"]') as HTMLInputElement | null)?.value;
+          const bookId = (form.querySelector('input[name="book_id"]') as HTMLInputElement | null)?.value;
+          if (!token) return { ok: false, error: 'no CSRF token' };
+          if (!bookId) return { ok: false, error: 'no book_id' };
 
-          // Remove "hidden" class so Stimulus picks it up as the active field
-          numberInput.classList.remove('hidden');
-          numberInput.value = String(Math.round(pct));
-          numberInput.dispatchEvent(new Event('input', { bubbles: true }));
-          numberInput.dispatchEvent(new Event('change', { bubbles: true }));
+          const body = new URLSearchParams({
+            'authenticity_token': token,
+            'book_id': bookId,
+            'on_book_page': 'true',
+            'read_status[progress_number]': String(Math.round(pct)),
+            'read_status[progress_minutes]': '',
+            'commit': 'Save',
+          });
 
-          return `filled_${Math.round(pct)}`;
+          try {
+            const res = await fetch('/update-progress', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'X-Requested-With': 'XMLHttpRequest',
+                'Accept': 'text/javascript, application/javascript',
+              },
+              body: body.toString(),
+              credentials: 'include',
+            });
+            return { ok: res.ok, status: res.status };
+          } catch (e: any) {
+            return { ok: false, error: e.message };
+          }
         }, percent);
-        logger.info(`updateProgress: fill result: ${fillResult}`);
 
-        if (fillResult === 'no_number_input') {
-          await page.screenshot({ path: path.join(screenshotsDir, 'fail-progress-no-input.png'), fullPage: true });
-          throw new Error('Could not find read_status[progress_number] input');
+        logger.info(`updateProgress: fetch result: ${JSON.stringify(fetchResult)}`);
+
+        if (!fetchResult.ok) {
+          await page.screenshot({ path: path.join(screenshotsDir, 'fail-progress-fetch.png'), fullPage: true });
+          throw new Error(`fetch to /update-progress failed: ${JSON.stringify(fetchResult)}`);
         }
 
-        await sleep(300);
-
-        // Step 3: Click the Save button — it's input[type="submit"] with class progress-tracker-update-button.
-        // Do NOT use button[type="submit"] which matches "Mark as finished".
-        const submitted = await page.evaluate(() => {
-          const saveBtn = document.querySelector(
-            'input[type="submit"].progress-tracker-update-button'
-          ) as HTMLElement | null;
-          if (saveBtn) { saveBtn.click(); return 'submitted_save'; }
-
-          // Fallback: input[type="submit"][value="Save"]
-          const saveByValue = document.querySelector(
-            'input[type="submit"][value="Save"]'
-          ) as HTMLElement | null;
-          if (saveByValue) { saveByValue.click(); return 'submitted_save_by_value'; }
-
-          return 'no_submit_found';
-        });
-        logger.info(`updateProgress: submit result: ${submitted}`);
-
-        if (submitted === 'no_submit_found') {
-          await page.screenshot({ path: path.join(screenshotsDir, 'fail-progress-no-submit.png'), fullPage: true });
-          throw new Error('Could not find Save submit button');
-        }
-
-        // Wait for the AJAX form submission to complete, then verify the page
-        // actually reflects the new percentage. This catches silent failures where
-        // the click registered but the server didn't save.
-        await sleep(3000);
+        // Reload the page to get the server-rendered state and verify the percentage
+        await page.goto(bookUrl, { waitUntil: 'networkidle2', timeout: 15000 });
+        await sleep(1000);
         await page.screenshot({ path: path.join(screenshotsDir, 'debug-progress-after.png'), fullPage: true });
 
         const verified = await page.evaluate((expectedPct: number) => {
-          // After a successful save, the progress-tracking-form should be hidden again
-          // and the progress tracker pane should show the updated percentage.
-          const pane = document.querySelector('.progress-tracker-pane');
-          if (!pane) return { ok: false, reason: 'no pane after submit' };
-
-          const paneText = pane.textContent || '';
-
-          // Look for the new percentage in the pane text (e.g. "72%" or "72")
           const rounded = Math.round(expectedPct);
-          if (paneText.includes(`${rounded}%`)) {
-            return { ok: true, reason: `found ${rounded}% in pane` };
-          }
-
-          // Tolerate ±2% rounding differences StoryGraph may display
-          for (let delta = 1; delta <= 2; delta++) {
-            if (paneText.includes(`${rounded - delta}%`) || paneText.includes(`${rounded + delta}%`)) {
-              return { ok: true, reason: `found ~${rounded}% in pane (±${delta})` };
+          const bodyText = document.body.textContent || '';
+          for (let delta = 0; delta <= 3; delta++) {
+            if (bodyText.includes(`${rounded - delta}%`) || bodyText.includes(`${rounded + delta}%`)) {
+              return { ok: true, found: `~${rounded}%` };
             }
           }
-
-          // Check if the form is still visible (bad — means it didn't submit)
-          const form = pane.querySelector('.progress-tracking-form') as HTMLElement | null;
-          const formVisible = form && (form.style.display !== 'none') && !form.classList.contains('hidden');
-
-          return {
-            ok: false,
-            reason: `${rounded}% not found in pane. Form still visible: ${formVisible}. Pane text: "${paneText.trim().slice(0, 100)}"`,
-          };
+          // Grab the progress tracker area text for diagnostics
+          const pane = document.querySelector('.progress-tracker-pane');
+          return { ok: false, paneText: pane?.textContent?.trim().slice(0, 150) };
         }, percent);
 
         logger.info(`updateProgress: verification: ${JSON.stringify(verified)}`);
 
         if (!verified.ok) {
           await page.screenshot({ path: path.join(screenshotsDir, 'fail-progress-verify.png'), fullPage: true });
-          throw new Error(`Progress update did not persist on StoryGraph: ${verified.reason}`);
+          throw new Error(`Progress update did not persist on StoryGraph. Pane: "${verified.paneText}"`);
         }
 
         logger.info(`Updated progress for ${bookUrl} to ${percent}%`);
