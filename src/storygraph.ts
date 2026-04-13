@@ -459,9 +459,50 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
           throw new Error('Could not find Save submit button');
         }
 
-        // Wait for the AJAX form submission to complete
+        // Wait for the AJAX form submission to complete, then verify the page
+        // actually reflects the new percentage. This catches silent failures where
+        // the click registered but the server didn't save.
         await sleep(3000);
         await page.screenshot({ path: path.join(screenshotsDir, 'debug-progress-after.png'), fullPage: true });
+
+        const verified = await page.evaluate((expectedPct: number) => {
+          // After a successful save, the progress-tracking-form should be hidden again
+          // and the progress tracker pane should show the updated percentage.
+          const pane = document.querySelector('.progress-tracker-pane');
+          if (!pane) return { ok: false, reason: 'no pane after submit' };
+
+          const paneText = pane.textContent || '';
+
+          // Look for the new percentage in the pane text (e.g. "72%" or "72")
+          const rounded = Math.round(expectedPct);
+          if (paneText.includes(`${rounded}%`)) {
+            return { ok: true, reason: `found ${rounded}% in pane` };
+          }
+
+          // Tolerate ±2% rounding differences StoryGraph may display
+          for (let delta = 1; delta <= 2; delta++) {
+            if (paneText.includes(`${rounded - delta}%`) || paneText.includes(`${rounded + delta}%`)) {
+              return { ok: true, reason: `found ~${rounded}% in pane (±${delta})` };
+            }
+          }
+
+          // Check if the form is still visible (bad — means it didn't submit)
+          const form = pane.querySelector('.progress-tracking-form') as HTMLElement | null;
+          const formVisible = form && (form.style.display !== 'none') && !form.classList.contains('hidden');
+
+          return {
+            ok: false,
+            reason: `${rounded}% not found in pane. Form still visible: ${formVisible}. Pane text: "${paneText.trim().slice(0, 100)}"`,
+          };
+        }, percent);
+
+        logger.info(`updateProgress: verification: ${JSON.stringify(verified)}`);
+
+        if (!verified.ok) {
+          await page.screenshot({ path: path.join(screenshotsDir, 'fail-progress-verify.png'), fullPage: true });
+          throw new Error(`Progress update did not persist on StoryGraph: ${verified.reason}`);
+        }
+
         logger.info(`Updated progress for ${bookUrl} to ${percent}%`);
       });
     },
