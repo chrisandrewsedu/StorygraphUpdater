@@ -413,6 +413,7 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
           const body = new URLSearchParams({
             'book_id': bookId,
             'on_book_page': 'true',
+            'read_status[progress_type]': 'percentage',   // required: tells server to use progress_number not minutes
             'read_status[progress_number]': String(Math.round(pct)),
             'read_status[progress_minutes]': '',
             'commit': 'Save',
@@ -451,15 +452,36 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
 
         const verified = await page.evaluate((expectedPct: number) => {
           const rounded = Math.round(expectedPct);
-          const bodyText = document.body.textContent || '';
-          for (let delta = 0; delta <= 3; delta++) {
-            if (bodyText.includes(`${rounded - delta}%`) || bodyText.includes(`${rounded + delta}%`)) {
-              return { ok: true, found: `~${rounded}%` };
+
+          // Check the progress bar element — StoryGraph renders the percentage
+          // as the text content of the element that has the teal progress bar style.
+          // Also check the track-progress-button which shows current % when progress exists.
+          const candidates = [
+            document.querySelector('.progress-tracker-pane'),
+            document.querySelector('[class*="progress-bar"]'),
+            document.querySelector('[style*="width"]'),
+          ];
+
+          for (const el of candidates) {
+            if (!el) continue;
+            const text = el.textContent || '';
+            for (let delta = 0; delta <= 2; delta++) {
+              if (text.includes(`${rounded - delta}%`) || text.includes(`${rounded + delta}%`)) {
+                return { ok: true, found: `~${rounded}% in ${el.className?.slice(0, 40)}` };
+              }
             }
           }
-          // Grab the progress tracker area text for diagnostics
+
+          // Fallback: check the number input min attribute — StoryGraph sets min=N
+          // where N is the current progress, so after a successful save it should reflect the new value
+          const numInput = document.querySelector('input[name="read_status[progress_number]"]') as HTMLInputElement | null;
+          const minVal = numInput ? parseInt(numInput.min || '0', 10) : null;
+          if (minVal !== null && Math.abs(minVal - rounded) <= 2) {
+            return { ok: true, found: `min attr=${minVal} matches ~${rounded}%` };
+          }
+
           const pane = document.querySelector('.progress-tracker-pane');
-          return { ok: false, paneText: pane?.textContent?.trim().slice(0, 150) };
+          return { ok: false, paneText: pane?.textContent?.trim().slice(0, 150), minAttr: minVal };
         }, percent);
 
         logger.info(`updateProgress: verification: ${JSON.stringify(verified)}`);
