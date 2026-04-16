@@ -9,6 +9,7 @@ export interface Bot {
   start(): void;
   sendSyncSummary(results: SyncResult[]): Promise<void>;
   promptNewBook(book: AbsBookProgress): Promise<void>;
+  promptBookFinished(mapping: { mappingId: number; title: string; storygraphBookUrl: string }): Promise<void>;
   sendError(message: string): Promise<void>;
 }
 
@@ -162,6 +163,7 @@ export function createBot(options: CreateBotOptions): Bot {
       '/recommend — pick 3 random books from your TBR',
       '/reading <title> — mark a book as currently reading on StoryGraph',
       '/finished <title> — mark a book as read on StoryGraph',
+      '/dnf <title> — mark a book as Did Not Finish on StoryGraph',
       '/link <title> — link an ABS book to a StoryGraph edition',
     ].join('\n'));
   });
@@ -210,9 +212,10 @@ export function createBot(options: CreateBotOptions): Bot {
     if (!isAuthorized(msg)) return;
     await reply(msg.chat.id, 'Starting manual sync...');
     try {
-      const results = await runSync(absClient, db, storygraph, (book) => {
-        promptNewBookInternal(book).catch((err) => logger.error('promptNewBook error', err));
-      });
+      const results = await runSync(absClient, db, storygraph,
+        (book) => { promptNewBookInternal(book).catch((err) => logger.error('promptNewBook error', err)); },
+        (mapping) => { promptBookFinishedInternal(mapping).catch((err) => logger.error('promptBookFinished error', err)); }
+      );
       await sendSyncSummaryInternal(results);
     } catch (err) {
       logger.error('/sync error', err);
@@ -346,6 +349,27 @@ export function createBot(options: CreateBotOptions): Bot {
         `Pick the book, then choose the edition:`);
     } catch (err) {
       logger.error('/finished error', err);
+      await reply(msg.chat.id, `Search failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  });
+
+  // ── /dnf <title> ─────────────────────────────────────────────────────────────
+
+  bot.onText(/^\/dnf (.+)/, async (msg, match) => {
+    if (!isAuthorized(msg)) return;
+    const query = match?.[1]?.trim();
+    if (!query) { await reply(msg.chat.id, 'Usage: /dnf <title>'); return; }
+
+    await reply(msg.chat.id, `Searching for: *${escapeMd(query)}*...`);
+    try {
+      const results = await storygraph.searchBooks(query);
+      if (results.length === 0) { await reply(msg.chat.id, 'No results found.'); return; }
+
+      await sendSearchResults(msg.chat.id, results.slice(0, 3),
+        (r) => `dnf_ed:${cacheUrl(r.bookUrl)}`,
+        `Pick the book to mark as Did Not Finish:`);
+    } catch (err) {
+      logger.error('/dnf error', err);
       await reply(msg.chat.id, `Search failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   });
@@ -691,9 +715,86 @@ export function createBot(options: CreateBotOptions): Bot {
       await reply(cid, `Marking as read...`);
       try {
         await storygraph.markAsRead(bookUrl);
-        await reply(cid, `Marked as read!`);
+        await reply(cid, `✅ Marked as finished!`);
       } catch (err) {
         await reply(cid, `Failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      return;
+    }
+
+    // dnf_ed:<urlId> → /dnf step 2: show editions
+    if (data.startsWith('dnf_ed:')) {
+      const urlId = parseInt(data.slice(7), 10);
+      const bookUrl = getCachedUrl(urlId);
+      if (!bookUrl) { await reply(cid, 'Button expired. Please search again.'); return; }
+      await reply(cid, `Loading editions...`);
+      try {
+        const editions = await storygraph.getEditions(bookUrl);
+        if (editions.length === 0) {
+          await storygraph.markAsDNF(bookUrl);
+          await reply(cid, `🚫 Marked as Did Not Finish!`);
+          return;
+        }
+        await sendEditionResults(cid, editions,
+          (e) => `dnf:${cacheUrl(e.bookUrl)}`,
+          `Pick the edition to mark as DNF:`);
+      } catch (err) {
+        logger.error('dnf editions error', err);
+        await reply(cid, `Failed to load editions. Using main book page...`);
+        await storygraph.markAsDNF(bookUrl).catch(() => null);
+        await reply(cid, `🚫 Marked as Did Not Finish!`);
+      }
+      return;
+    }
+
+    // dnf:<urlId>
+    if (data.startsWith('dnf:')) {
+      const urlId = parseInt(data.slice(4), 10);
+      const bookUrl = getCachedUrl(urlId);
+      if (!bookUrl) { await reply(cid, 'Button expired. Please search again.'); return; }
+      await reply(cid, `Marking as Did Not Finish...`);
+      try {
+        await storygraph.markAsDNF(bookUrl);
+        await reply(cid, `🚫 Marked as Did Not Finish!`);
+      } catch (err) {
+        await reply(cid, `Failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      return;
+    }
+
+    // fin_yn:f/<d/s>:<mappingId> — finish/dnf/skip prompt response
+    if (data.startsWith('fin_yn:')) {
+      const parts = data.split(':'); // ['fin_yn', 'f'|'d'|'s', '<mappingId>']
+      const action = parts[1];
+      const mappingId = parseInt(parts[2] ?? '', 10);
+      if (!mappingId) return;
+
+      const mapping = db.getAllBookMappings().find((m) => m.id === mappingId);
+      if (!mapping) { await reply(cid, 'Book mapping not found.'); return; }
+
+      if (action === 's') {
+        if (msgId) await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: cid, message_id: msgId }).catch(() => null);
+        await reply(cid, `Skipped. You can use /finished or /dnf later.`);
+        return;
+      }
+
+      const isFinish = action === 'f';
+      await reply(cid, isFinish ? `Marking *${escapeMd(mapping.title)}* as finished...` : `Marking *${escapeMd(mapping.title)}* as Did Not Finish...`);
+      try {
+        if (isFinish) {
+          await storygraph.markAsRead(mapping.storygraphBookUrl);
+          db.logSync({ bookMappingId: mappingId, progressPercent: 100, action: 'mark_read', status: 'success', errorMessage: null });
+          await reply(cid, `✅ *${escapeMd(mapping.title)}* marked as finished on StoryGraph!`);
+        } else {
+          await storygraph.markAsDNF(mapping.storygraphBookUrl);
+          db.logSync({ bookMappingId: mappingId, progressPercent: 0, action: 'mark_dnf', status: 'success', errorMessage: null });
+          await reply(cid, `🚫 *${escapeMd(mapping.title)}* marked as Did Not Finish on StoryGraph.`);
+        }
+        if (msgId) await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: cid, message_id: msgId }).catch(() => null);
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        db.logSync({ bookMappingId: mappingId, progressPercent: 0, action: isFinish ? 'mark_read' : 'mark_dnf', status: 'failed', errorMessage: errMsg });
+        await reply(cid, `Failed: ${escapeMd(errMsg)}`);
       }
       return;
     }
@@ -764,6 +865,22 @@ export function createBot(options: CreateBotOptions): Bot {
     }
   }
 
+  async function promptBookFinishedInternal(mapping: { mappingId: number; title: string; storygraphBookUrl: string }): Promise<void> {
+    logger.info(`Prompting finish/DNF for: ${mapping.title}`);
+    await reply(chatId,
+      `📚 *${escapeMd(mapping.title)}* is no longer in your Audiobookshelf library.\n\nDid you finish it?`,
+      {
+        reply_markup: {
+          inline_keyboard: [[
+            { text: '✅ Finished', callback_data: `fin_yn:f:${mapping.mappingId}` },
+            { text: '🚫 Did Not Finish', callback_data: `fin_yn:d:${mapping.mappingId}` },
+            { text: '⏸ Skip', callback_data: `fin_yn:s:${mapping.mappingId}` },
+          ]],
+        },
+      }
+    );
+  }
+
   async function sendSyncSummaryInternal(results: SyncResult[]): Promise<void> {
     if (results.length === 0) {
       await reply(chatId, 'Sync complete. No actions needed.');
@@ -784,6 +901,7 @@ export function createBot(options: CreateBotOptions): Bot {
     start() { logger.info('Telegram bot started (polling)'); },
     async sendSyncSummary(results: SyncResult[]) { await sendSyncSummaryInternal(results); },
     async promptNewBook(book: AbsBookProgress) { await promptNewBookInternal(book); },
+    async promptBookFinished(mapping: { mappingId: number; title: string; storygraphBookUrl: string }) { await promptBookFinishedInternal(mapping); },
     async sendError(message: string) { await reply(chatId, `Error: ${message}`); },
   };
 }

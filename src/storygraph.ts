@@ -33,6 +33,7 @@ export interface StoryGraph {
   updateProgress(bookUrl: string, percent: number): Promise<void>;
   markAsReading(bookUrl: string): Promise<void>;
   markAsRead(bookUrl: string): Promise<void>;
+  markAsDNF(bookUrl: string): Promise<void>;
   addToTBR(bookUrl: string): Promise<void>;
   getTBRList(username: string): Promise<StoryGraphBook[]>;
   close(): Promise<void>;
@@ -135,6 +136,47 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
         throw error;
       }
     }
+  }
+
+  /** POST to /update-status.js?...&status=STATUS using the form's own CSRF token. */
+  async function postStatus(status: string, screenshotName: string): Promise<void> {
+    const result = await page.evaluate(async (s: string) => {
+      // update-status forms each have their own authenticity_token hidden input
+      const form = document.querySelector(
+        `form[action*="update-status"][action*="status=${s}"]`
+      ) as HTMLFormElement | null;
+      if (!form) return { ok: false, error: `no form found for status=${s}` };
+
+      const token =
+        (form.querySelector('input[name="authenticity_token"]') as HTMLInputElement | null)?.value ||
+        document.querySelector('meta[name="csrf-token"]')?.getAttribute('content');
+      if (!token) return { ok: false, error: 'no CSRF token' };
+
+      const action = form.getAttribute('action') || '';
+      try {
+        const res = await fetch(action, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'X-CSRF-Token': token,
+            'X-Requested-With': 'XMLHttpRequest',
+            'Accept': 'text/javascript, application/javascript',
+          },
+          body: new URLSearchParams({ authenticity_token: token }).toString(),
+          credentials: 'include',
+        });
+        return { ok: res.ok, status: res.status };
+      } catch (e: any) {
+        return { ok: false, error: e.message };
+      }
+    }, status);
+
+    logger.info(`postStatus(${status}): ${JSON.stringify(result)}`);
+    if (!result.ok) {
+      throw new Error(`Failed to set status=${status}: ${JSON.stringify(result)}`);
+    }
+    await sleep(1500);
+    await page.screenshot({ path: path.join(screenshotsDir, screenshotName), fullPage: false });
   }
 
   return {
@@ -548,35 +590,18 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
         logger.info(`StoryGraph markAsRead: navigating to ${bookUrl}`);
         await page.goto(bookUrl, { waitUntil: 'networkidle2', timeout: 15000 });
         await handleTurnstile(bookUrl);
-
-        // The book page shows "mark as finished" as an option
-        const clicked = await page.evaluate(() => {
-          const allEls = Array.from(document.querySelectorAll('button, a, [role="button"], [role="menuitem"]'));
-          // Look for "mark as finished" or "finished" button
-          const finishedBtn = allEls.find((el) => {
-            const text = el.textContent?.trim().toLowerCase() || '';
-            return text.includes('mark as') && text.includes('finished');
-          });
-          if (finishedBtn) {
-            (finishedBtn as HTMLElement).click();
-            return 'clicked_finished';
-          }
-          // Fallback: look for "Read" option
-          const readBtn = allEls.find((el) => {
-            const text = el.textContent?.trim().toLowerCase() || '';
-            return text === 'read' || text === 'mark as read';
-          });
-          if (readBtn) {
-            (readBtn as HTMLElement).click();
-            return 'clicked_read';
-          }
-          return 'no_button_found';
-        });
-        logger.info(`markAsRead: click result: ${clicked}`);
-
-        await sleep(1000);
-        await page.screenshot({ path: path.join(screenshotsDir, 'debug-mark-read.png'), fullPage: true });
+        await postStatus('read', 'debug-mark-read.png');
         logger.info(`Marked as read: ${bookUrl}`);
+      });
+    },
+
+    async markAsDNF(bookUrl: string): Promise<void> {
+      return withRetry('markAsDNF', async () => {
+        logger.info(`StoryGraph markAsDNF: navigating to ${bookUrl}`);
+        await page.goto(bookUrl, { waitUntil: 'networkidle2', timeout: 15000 });
+        await handleTurnstile(bookUrl);
+        await postStatus('did-not-finish', 'debug-mark-dnf.png');
+        logger.info(`Marked as DNF: ${bookUrl}`);
       });
     },
 

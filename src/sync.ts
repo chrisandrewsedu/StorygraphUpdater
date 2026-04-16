@@ -68,14 +68,17 @@ export async function runSync(
   absClient: AbsClient,
   db: Database,
   storygraph: StoryGraph,
-  onNewBook: (book: AbsBookProgress) => void
+  onNewBook: (book: AbsBookProgress) => void,
+  onBookFinished: (mapping: { mappingId: number; title: string; storygraphBookUrl: string }) => void
 ): Promise<SyncResult[]> {
   logger.info('Starting sync...');
   const results: SyncResult[] = [];
 
   const booksInProgress = await absClient.getItemsInProgress();
   logger.info(`Found ${booksInProgress.length} books in progress`);
+  const inProgressIds = new Set(booksInProgress.map((b) => b.absLibraryItemId));
 
+  // --- Pass 1: sync in-progress books ---
   for (const book of booksInProgress) {
     const mapping = db.getBookMappingByAbsId(book.absLibraryItemId);
     const lastSync = mapping ? db.getLastSync(mapping.id) : null;
@@ -97,7 +100,6 @@ export async function runSync(
 
     for (const action of actions) {
       if (action.type === 'new_book') {
-        // Notify via Telegram — user must confirm the StoryGraph mapping
         onNewBook(book);
         results.push({ book: book.title, action: 'new_book_detected', success: true });
         continue;
@@ -137,16 +139,40 @@ export async function runSync(
           errorMessage: errorMsg,
         });
 
-        results.push({
-          book: book.title,
-          action: action.type,
-          success: false,
-          error: errorMsg,
-          screenshotPath,
-        });
+        results.push({ book: book.title, action: action.type, success: false, error: errorMsg, screenshotPath });
         logger.error(`Failed to sync ${book.title}: ${errorMsg}`);
       }
     }
+  }
+
+  // --- Pass 2: detect books that disappeared from ABS — prompt user to finish or DNF ---
+  const allMappings = db.getAllBookMappings();
+  for (const mapping of allMappings) {
+    if (inProgressIds.has(mapping.absLibraryItemId)) continue; // still in progress
+
+    const lastSync = db.getLastSync(mapping.id);
+    if (!lastSync) continue; // never started tracking
+
+    // Skip if already resolved
+    const doneActions = ['mark_read', 'mark_dnf', 'finish_prompted'];
+    if (doneActions.includes(lastSync.action) && lastSync.status === 'success') continue;
+
+    // Only prompt if the user was meaningfully through the book (>80%)
+    if (lastSync.progressPercent < 80) continue;
+
+    logger.info(`${mapping.title} is no longer in ABS (last progress: ${Math.round(lastSync.progressPercent)}%) — prompting user`);
+
+    // Log that we've prompted so we don't re-ask every sync
+    db.logSync({
+      bookMappingId: mapping.id,
+      progressPercent: lastSync.progressPercent,
+      action: 'finish_prompted',
+      status: 'success',
+      errorMessage: null,
+    });
+
+    results.push({ book: mapping.title, action: 'finish_prompted', success: true });
+    onBookFinished({ mappingId: mapping.id, title: mapping.title, storygraphBookUrl: mapping.storygraphBookUrl });
   }
 
   logger.info(`Sync complete. ${results.length} actions processed.`);

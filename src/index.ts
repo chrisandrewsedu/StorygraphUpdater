@@ -61,9 +61,10 @@ async function main() {
         return;
       }
 
-      const results = await runSync(absClient, db, storygraph, (book) => {
-        bot.promptNewBook(book);
-      });
+      const results = await runSync(absClient, db, storygraph,
+        (book) => { bot.promptNewBook(book); },
+        (mapping) => { bot.promptBookFinished(mapping); }
+      );
       await bot.sendSyncSummary(results);
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
