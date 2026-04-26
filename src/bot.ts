@@ -54,16 +54,22 @@ export function createBot(options: CreateBotOptions): Bot {
 
   // ── Helper utilities ─────────────────────────────────────────────────────────
 
-  /** Escape Telegram legacy Markdown special characters: _ * ` [ */
+  /** Escape Telegram legacy Markdown special characters: _ * ` [ ] */
   function escapeMd(text: string): string {
-    return text.replace(/([_*`\[])/g, '\\$1');
+    return text.replace(/([_*`\[\]])/g, '\\$1');
   }
 
   async function reply(chatIdTarget: string | number, text: string, extra?: TelegramBot.SendMessageOptions): Promise<void> {
     try {
       await bot.sendMessage(chatIdTarget, text, { parse_mode: 'Markdown', ...extra });
     } catch (err) {
-      logger.error('Failed to send Telegram message', err);
+      // Fallback: retry without parse_mode so malformed markdown never silently drops a message.
+      logger.error('Failed to send Telegram message with Markdown, retrying as plain text', err);
+      try {
+        await bot.sendMessage(chatIdTarget, text, { ...extra, parse_mode: undefined });
+      } catch (err2) {
+        logger.error('Plain-text retry also failed', err2);
+      }
     }
   }
 
@@ -474,7 +480,8 @@ export function createBot(options: CreateBotOptions): Bot {
               author: absBook?.author ?? '',
               editionType: 'audio',
             });
-            await reply(cid, `Linked *${absBook?.title ?? absId}* to StoryGraph!\n${bookUrl}`);
+            await storygraph.markAsReading(bookUrl).catch((e) => logger.warn(`markAsReading failed: ${e.message}`));
+            await reply(cid, `Linked *${absBook?.title ?? absId}* to StoryGraph and marked as currently reading!\n${bookUrl}`);
           } else {
             await reply(cid, `No audiobook editions found. Showing first 3 of ${allEditions.length} editions:`);
             await sendEditionResults(cid, allEditions.slice(0, 3),
@@ -486,14 +493,16 @@ export function createBot(options: CreateBotOptions): Bot {
 
         if (filteredAudio.length === 1) {
           const edition = filteredAudio[0];
+          const editionUrl = edition.bookUrl || bookUrl;
           db.upsertBookMapping({
             absLibraryItemId: absId,
-            storygraphBookUrl: edition.bookUrl || bookUrl,
+            storygraphBookUrl: editionUrl,
             title: absBook?.title ?? absId,
             author: absBook?.author ?? '',
             editionType: 'audio',
           });
-          await reply(cid, `Found one audiobook edition — auto-linked!\n*${absBook?.title ?? absId}*\n${edition.info}\n${edition.bookUrl || bookUrl}`);
+          await storygraph.markAsReading(editionUrl).catch((e) => logger.warn(`markAsReading failed: ${e.message}`));
+          await reply(cid, `Found one audiobook edition — auto-linked and marked as currently reading!\n*${absBook?.title ?? absId}*\n${edition.info}\n${editionUrl}`);
           return;
         }
 
@@ -531,7 +540,8 @@ export function createBot(options: CreateBotOptions): Bot {
           author: absBook?.author ?? '',
           editionType: 'audio',
         });
-        await reply(cid, `Linked *${absBook?.title ?? absId}* to StoryGraph!\n${bookUrl}`);
+        await storygraph.markAsReading(bookUrl).catch((e) => logger.warn(`markAsReading failed: ${e.message}`));
+        await reply(cid, `Linked *${absBook?.title ?? absId}* to StoryGraph and marked as currently reading!\n${bookUrl}`);
       }
       return;
     }
@@ -578,7 +588,7 @@ export function createBot(options: CreateBotOptions): Bot {
       const bookUrl = getCachedUrl(urlId);
       if (!bookUrl) { await reply(cid, 'Button expired. Please search again.'); return; }
 
-      await reply(cid, `Linking edition...`);
+      await reply(cid, `Linking edition and marking as currently reading...`);
       try {
         const booksInProgress = await absClient.getItemsInProgress();
         const absBook = booksInProgress.find((b) => b.absLibraryItemId === absId);
@@ -589,10 +599,11 @@ export function createBot(options: CreateBotOptions): Bot {
           author: absBook?.author ?? '',
           editionType: 'audio',
         });
-        await reply(cid, `Linked *${absBook?.title ?? absId}* to StoryGraph edition!\n${bookUrl}`);
+        await storygraph.markAsReading(bookUrl);
+        await reply(cid, `✅ Linked *${absBook?.title ?? absId}* to StoryGraph and marked as currently reading!\n${bookUrl}`);
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
-        await reply(cid, `Failed to link: ${errMsg}`);
+        await reply(cid, `❌ Failed to link: ${errMsg}`);
       }
       return;
     }
@@ -716,9 +727,41 @@ export function createBot(options: CreateBotOptions): Bot {
       try {
         await storygraph.markAsRead(bookUrl);
         await reply(cid, `✅ Marked as finished!`);
+        // Prompt for star rating (no mappingId here, use urlId as a stand-in cache key)
+        await sendRatingPrompt(cid, null, null, bookUrl);
       } catch (err) {
         await reply(cid, `Failed: ${err instanceof Error ? err.message : String(err)}`);
       }
+      return;
+    }
+
+    // rate:<urlCacheId>:<whole>:<fraction> — star rating response
+    if (data.startsWith('rate:')) {
+      const parts = data.split(':'); // ['rate', urlCacheId, whole, fraction]
+      const urlCacheId = parseInt(parts[1] ?? '', 10);
+      const whole = parseInt(parts[2] ?? '', 10);
+      const fraction = parseInt(parts[3] ?? '0', 10) as 0 | 25 | 50 | 75;
+      const bookUrl = getCachedUrl(urlCacheId);
+      if (!bookUrl) { await reply(cid, '❌ Rating session expired — please use /finished again.'); return; }
+      const starsLabel = fraction === 0 ? `${whole}` : `${whole}.${fraction === 50 ? '5' : fraction === 25 ? '25' : '75'}`;
+      await reply(cid, `Submitting ${starsLabel} ⭐ rating...`);
+      try {
+        await storygraph.rateBook(bookUrl, whole, fraction);
+        if (msgId) await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: cid, message_id: msgId }).catch(() => null);
+        await reply(cid, `✅ Rated ${starsLabel} stars on StoryGraph!`);
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        logger.error(`rateBook failed: ${errMsg}`);
+        if (msgId) await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: cid, message_id: msgId }).catch(() => null);
+        await reply(cid, `❌ Rating failed — StoryGraph did not accept the submission.\n\n_Error: ${escapeMd(errMsg)}_\n\nYou can try rating manually at: ${bookUrl}`);
+      }
+      return;
+    }
+
+    // rate_skip:<urlCacheId> — skip rating
+    if (data.startsWith('rate_skip:')) {
+      if (msgId) await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: cid, message_id: msgId }).catch(() => null);
+      await reply(cid, `Rating skipped.`);
       return;
     }
 
@@ -784,13 +827,16 @@ export function createBot(options: CreateBotOptions): Bot {
         if (isFinish) {
           await storygraph.markAsRead(mapping.storygraphBookUrl);
           db.logSync({ bookMappingId: mappingId, progressPercent: 100, action: 'mark_read', status: 'success', errorMessage: null });
+          if (msgId) await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: cid, message_id: msgId }).catch(() => null);
           await reply(cid, `✅ *${escapeMd(mapping.title)}* marked as finished on StoryGraph!`);
+          // Prompt for rating
+          await sendRatingPrompt(cid, mappingId, mapping.title, mapping.storygraphBookUrl);
         } else {
           await storygraph.markAsDNF(mapping.storygraphBookUrl);
           db.logSync({ bookMappingId: mappingId, progressPercent: 0, action: 'mark_dnf', status: 'success', errorMessage: null });
+          if (msgId) await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: cid, message_id: msgId }).catch(() => null);
           await reply(cid, `🚫 *${escapeMd(mapping.title)}* marked as Did Not Finish on StoryGraph.`);
         }
-        if (msgId) await bot.editMessageReplyMarkup({ inline_keyboard: [] }, { chat_id: cid, message_id: msgId }).catch(() => null);
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
         db.logSync({ bookMappingId: mappingId, progressPercent: 0, action: isFinish ? 'mark_read' : 'mark_dnf', status: 'failed', errorMessage: errMsg });
@@ -863,6 +909,52 @@ export function createBot(options: CreateBotOptions): Bot {
       logger.error('promptNewBook error', err);
       await reply(chatId, `New book detected: *${book.title}* by ${book.author}\n\nFailed to search StoryGraph. Use /link to connect it manually.`);
     }
+  }
+
+  /**
+   * Send a star rating prompt. mappingId/title are optional (used when we have a DB mapping);
+   * bookUrl is always required so we can pass it via the url cache to the rate: handler.
+   */
+  async function sendRatingPrompt(
+    chatIdTarget: string | number,
+    mappingId: number | null,
+    title: string | null,
+    bookUrl: string
+  ): Promise<void> {
+    const urlCacheId = cacheUrl(bookUrl);
+    const skipData = `rate_skip:${urlCacheId}`;
+
+    // Half-star increments 1–5  →  callback_data: rate:<urlCacheId>:<whole>:<frac>
+    const stars: Array<{ label: string; whole: number; frac: 0 | 25 | 50 | 75 }> = [
+      { label: '⭐1',   whole: 1, frac: 0  },
+      { label: '⭐1.5', whole: 1, frac: 50 },
+      { label: '⭐2',   whole: 2, frac: 0  },
+      { label: '⭐2.5', whole: 2, frac: 50 },
+      { label: '⭐3',   whole: 3, frac: 0  },
+      { label: '⭐3.5', whole: 3, frac: 50 },
+      { label: '⭐4',   whole: 4, frac: 0  },
+      { label: '⭐4.5', whole: 4, frac: 50 },
+      { label: '⭐5',   whole: 5, frac: 0  },
+    ];
+
+    const buttons = stars.map((s) => ({
+      text: s.label,
+      callback_data: `rate:${urlCacheId}:${s.whole}:${s.frac}`,
+    }));
+
+    // Layout: 3 rows of 3 stars + 1 skip row
+    const inline_keyboard = [
+      buttons.slice(0, 3),
+      buttons.slice(3, 6),
+      buttons.slice(6, 9),
+      [{ text: 'Skip rating', callback_data: skipData }],
+    ];
+
+    const prompt = title
+      ? `How would you rate *${escapeMd(title)}*?`
+      : `How would you rate this book?`;
+
+    await reply(chatIdTarget, prompt, { reply_markup: { inline_keyboard } });
   }
 
   async function promptBookFinishedInternal(mapping: { mappingId: number; title: string; storygraphBookUrl: string }): Promise<void> {

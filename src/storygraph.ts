@@ -34,6 +34,8 @@ export interface StoryGraph {
   markAsReading(bookUrl: string): Promise<void>;
   markAsRead(bookUrl: string): Promise<void>;
   markAsDNF(bookUrl: string): Promise<void>;
+  /** Rate a book. wholeStars: 0–5, fraction: 0 | 25 | 50 | 75 (represents 0.00/0.25/0.50/0.75 stars). */
+  rateBook(bookUrl: string, wholeStars: number, fraction: 0 | 25 | 50 | 75): Promise<void>;
   addToTBR(bookUrl: string): Promise<void>;
   getTBRList(username: string): Promise<StoryGraphBook[]>;
   close(): Promise<void>;
@@ -419,20 +421,72 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
         }
 
         await page.evaluate(() => window.scrollTo(0, 0));
-        await sleep(500);
         await page.screenshot({ path: path.join(screenshotsDir, 'debug-progress-before.png') });
 
-        // Click "Track progress" to reveal the form and populate the CSRF token
-        const formInfo = await page.evaluate(() => {
-          const btn = document.querySelector('.track-progress-button') as HTMLElement | null;
+        // StoryGraph book pages have THREE possible states for the progress tracker:
+        //   A) "currently reading" + has progress  →  .edit-progress button (pencil icon)
+        //   B) "currently reading" + no progress   →  .track-progress-button (first-time)
+        //   C) NOT currently reading (to-read/read)→  no .progress-tracker-pane at all,
+        //                                              but a "status=currently-reading"
+        //                                              form is present in the dropdown.
+        //
+        // First, give the button time to render (Stimulus/Turbo timing race).
+        let btnHandle = await page
+          .waitForSelector('.track-progress-button, .edit-progress', { timeout: 8000 })
+          .catch(() => null);
+
+        if (!btnHandle) {
+          // Button missing — figure out which state we're in
+          const state = await page.evaluate(() => {
+            const pane = document.querySelector('.progress-tracker-pane');
+            const statusForms = Array.from(
+              document.querySelectorAll('form[action*="update-status"]')
+            ).map((f) => f.getAttribute('action') ?? '');
+            const hasCurrentlyReadingForm = statusForms.some((a) =>
+              a.includes('status=currently-reading')
+            );
+            return {
+              paneExists: !!pane,
+              hasCurrentlyReadingForm,
+              statusForms,
+            };
+          });
+          logger.info(`updateProgress: state detection: ${JSON.stringify(state)}`);
+
+          if (!state.paneExists && state.hasCurrentlyReadingForm) {
+            // State C: book is in another status (to-read/read/dnf/paused). Promote it
+            // to "currently reading" so the progress tracker pane appears, then retry.
+            logger.info('updateProgress: book is not currently-reading on StoryGraph — setting status now');
+            await postStatus('currently-reading', 'debug-auto-set-reading.png');
+            await page.goto(bookUrl, { waitUntil: 'networkidle2', timeout: 15000 });
+            btnHandle = await page
+              .waitForSelector('.track-progress-button, .edit-progress', { timeout: 8000 })
+              .catch(() => null);
+          }
+
+          if (!btnHandle) {
+            await page.screenshot({
+              path: path.join(screenshotsDir, 'fail-progress-no-button.png'),
+              fullPage: true,
+            });
+            const reason = !state.paneExists
+              ? 'No progress-tracker-pane on the page after attempting to set currently-reading status.'
+              : 'progress-tracker-pane exists but neither .track-progress-button nor .edit-progress was found inside it.';
+            throw new Error(
+              `Progress tracker button not found on StoryGraph. ${reason} Check fail-progress-no-button.png and container logs.`
+            );
+          }
+        }
+
+        await page.screenshot({ path: path.join(screenshotsDir, 'debug-progress-before-click.png') });
+
+        // Click the button to reveal the progress entry form
+        let formInfo = await page.evaluate(() => {
+          const btn = document.querySelector('.track-progress-button, .edit-progress') as HTMLElement | null;
           if (!btn) return null;
           btn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
           return 'clicked';
         });
-        if (!formInfo) {
-          await page.screenshot({ path: path.join(screenshotsDir, 'fail-progress-no-button.png'), fullPage: true });
-          throw new Error('Could not find .track-progress-button on the page');
-        }
 
         // Wait for the form to appear so all hidden inputs (CSRF token etc.) are populated
         await page.waitForSelector('.progress-tracking-form', { timeout: 8000 }).catch(() => null);
@@ -602,6 +656,173 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
         await handleTurnstile(bookUrl);
         await postStatus('did-not-finish', 'debug-mark-dnf.png');
         logger.info(`Marked as DNF: ${bookUrl}`);
+      });
+    },
+
+    async rateBook(bookUrl: string, wholeStars: number, fraction: 0 | 25 | 50 | 75): Promise<void> {
+      return withRetry('rateBook', async () => {
+        logger.info(`StoryGraph rateBook: navigating to ${bookUrl} — rating ${wholeStars}.${fraction}`);
+        await page.goto(bookUrl, { waitUntil: 'networkidle2', timeout: 15000 });
+        await handleTurnstile(bookUrl);
+
+        await page.screenshot({ path: path.join(screenshotsDir, 'debug-rate-before.png'), fullPage: false });
+
+        // Step 1: Click the "Write a Review" or rating button to reveal the form
+        const clickResult = await page.evaluate(() => {
+          // StoryGraph shows a "Write a Review" link or star rating widget on the book page
+          const allLinks = Array.from(document.querySelectorAll('a, button'));
+          const reviewLink = allLinks.find((el) => {
+            const text = el.textContent?.trim().toLowerCase() ?? '';
+            const href = (el as HTMLAnchorElement).href ?? '';
+            return (
+              text.includes('write a review') ||
+              text.includes('add review') ||
+              text.includes('review this book') ||
+              href.includes('book_reviews')
+            );
+          });
+          if (reviewLink) {
+            (reviewLink as HTMLElement).click();
+            return { clicked: 'review_link', text: reviewLink.textContent?.trim().slice(0, 40) };
+          }
+
+          // Fallback: look for the star rating widget (often a row of star SVGs)
+          const starWidget = document.querySelector(
+            '[class*="star-rating"], [class*="rating"], [data-rating], [aria-label*="rate"]'
+          ) as HTMLElement | null;
+          if (starWidget) {
+            starWidget.click();
+            return { clicked: 'star_widget', cls: starWidget.className.slice(0, 40) };
+          }
+
+          return { clicked: 'none' };
+        });
+
+        logger.info(`rateBook: click result: ${JSON.stringify(clickResult)}`);
+        await sleep(1500);
+        await page.screenshot({ path: path.join(screenshotsDir, 'debug-rate-after-click.png'), fullPage: true });
+
+        // Step 2: Wait for a review form to appear and discover its structure
+        const formDiscovery = await page.evaluate(() => {
+          const forms = Array.from(document.querySelectorAll('form'));
+          const reviewForm = forms.find((f) => {
+            const action = f.getAttribute('action') ?? '';
+            return action.includes('book_review') || action.includes('review');
+          });
+          if (!reviewForm) {
+            return {
+              found: false,
+              forms: forms.map((f) => f.getAttribute('action')).filter(Boolean).slice(0, 5),
+            };
+          }
+
+          const selects = Array.from(reviewForm.querySelectorAll('select')).map((s) => ({
+            name: s.name,
+            options: Array.from(s.options).map((o) => ({ value: o.value, text: o.text })),
+          }));
+          const inputs = Array.from(reviewForm.querySelectorAll('input[type!="hidden"]')).map((i) => ({
+            name: (i as HTMLInputElement).name,
+            type: (i as HTMLInputElement).type,
+          }));
+          const token = (reviewForm.querySelector('input[name="authenticity_token"]') as HTMLInputElement | null)?.value
+            || document.querySelector('meta[name="csrf-token"]')?.getAttribute('content')
+            || '';
+          const bookId = (reviewForm.querySelector('input[name*="book_id"]') as HTMLInputElement | null)?.value ?? '';
+
+          return {
+            found: true,
+            action: reviewForm.getAttribute('action'),
+            method: reviewForm.getAttribute('method'),
+            selects,
+            inputs,
+            token: token.slice(0, 20) + '…',
+            bookId,
+          };
+        });
+
+        logger.info(`rateBook: form discovery: ${JSON.stringify(formDiscovery)}`);
+
+        if (!formDiscovery.found) {
+          // Navigate directly to the new-review page as a fallback
+          logger.info('rateBook: form not found after click, trying direct navigation to review page');
+          // Extract book id from the URL — StoryGraph book URLs: /books/<slug>
+          // The review URL is /book_reviews/new?book_id=<slug> or similar
+          await page.screenshot({ path: path.join(screenshotsDir, 'fail-rate-no-form.png'), fullPage: true });
+          throw new Error('Review form not found on the page. Check fail-rate-no-form.png screenshot.');
+        }
+
+        // Step 3: Submit the rating via fetch
+        const submitResult = await page.evaluate(
+          async (whole: number, frac: number) => {
+            const forms = Array.from(document.querySelectorAll('form'));
+            const reviewForm = forms.find((f) => {
+              const action = f.getAttribute('action') ?? '';
+              return action.includes('book_review') || action.includes('review');
+            }) as HTMLFormElement | null;
+            if (!reviewForm) return { ok: false, error: 'form disappeared' };
+
+            const action = reviewForm.getAttribute('action') ?? '';
+            const method = (reviewForm.getAttribute('method') ?? 'post').toUpperCase();
+
+            const token =
+              (reviewForm.querySelector('input[name="authenticity_token"]') as HTMLInputElement | null)?.value ||
+              document.querySelector('meta[name="csrf-token"]')?.getAttribute('content') ||
+              '';
+
+            // Collect all hidden inputs from the form
+            const hiddenParams: Record<string, string> = {};
+            reviewForm.querySelectorAll('input[type="hidden"]').forEach((inp) => {
+              const i = inp as HTMLInputElement;
+              if (i.name && i.name !== 'authenticity_token') hiddenParams[i.name] = i.value;
+            });
+
+            // Determine the select field names from the form
+            const selects = Array.from(reviewForm.querySelectorAll('select'));
+            const starSelect = selects.find((s) => s.name.toLowerCase().includes('star') && !s.name.toLowerCase().includes('fraction'));
+            const fracSelect = selects.find((s) => s.name.toLowerCase().includes('fraction'));
+
+            const starFieldName = starSelect?.name ?? 'book_review[star_rating]';
+            const fracFieldName = fracSelect?.name ?? 'book_review[star_rating_fraction]';
+
+            const body = new URLSearchParams({
+              authenticity_token: token,
+              ...hiddenParams,
+              [starFieldName]: String(whole),
+              [fracFieldName]: String(frac),
+            });
+
+            try {
+              const res = await fetch(action, {
+                method,
+                headers: {
+                  'Content-Type': 'application/x-www-form-urlencoded',
+                  'X-CSRF-Token': token,
+                  'X-Requested-With': 'XMLHttpRequest',
+                  Accept: 'text/javascript, application/javascript, text/html, */*',
+                },
+                body: body.toString(),
+                credentials: 'include',
+              });
+              const text = await res.text();
+              return { ok: res.ok, status: res.status, body: text.slice(0, 300) };
+            } catch (e: any) {
+              return { ok: false, error: e.message };
+            }
+          },
+          wholeStars,
+          fraction
+        );
+
+        logger.info(`rateBook: submit result: ${JSON.stringify(submitResult)}`);
+
+        if (!submitResult.ok) {
+          await page.screenshot({ path: path.join(screenshotsDir, 'fail-rate-submit.png'), fullPage: true });
+          throw new Error(`Rating submission failed: ${JSON.stringify(submitResult)}`);
+        }
+
+        await sleep(1000);
+        await page.screenshot({ path: path.join(screenshotsDir, 'debug-rate-after.png'), fullPage: false });
+        logger.info(`Rated ${bookUrl}: ${wholeStars}.${fraction} stars`);
       });
     },
 
