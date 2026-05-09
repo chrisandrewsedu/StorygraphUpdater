@@ -250,13 +250,16 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
         await page.screenshot({ path: path.join(screenshotsDir, 'debug-search-latest.png'), fullPage: true });
 
         const results = await page.evaluate(() => {
-          // Each search result is a card with: cover image | book-title-author-and-series | buttons
-          // We look at the parent card to find the cover image too
+          // Each search result card contains multiple anchors: the book title link,
+          // the author link, and series tag links. The book link is the only one we
+          // want — picking the first <a> blindly grabbed the series tag, causing the
+          // wrong-edition / hidden-result bugs we fixed previously.
           const bookElements = document.querySelectorAll('.book-title-author-and-series');
           return Array.from(bookElements).slice(0, 10).map((el) => {
-            const linkEl = el.querySelector('a');
-            const title = linkEl?.textContent?.trim() || '';
-            const bookUrl = linkEl?.getAttribute('href') || '';
+            const bookLink = el.querySelector('a[href*="/books/"]') as HTMLAnchorElement | null;
+            if (!bookLink) return null;
+            const title = bookLink.textContent?.trim() || '';
+            const bookUrl = bookLink.getAttribute('href') || '';
 
             // Author and edition info from text lines
             const fullText = el.textContent || '';
@@ -273,19 +276,16 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
             const coverUrl = imgEl?.getAttribute('src') || '';
 
             return { title, author, bookUrl, editionInfo, coverUrl };
-          });
+          }).filter((r): r is NonNullable<typeof r> => r !== null);
         });
 
-        // Drop non-book results (series, author, etc.) — StoryGraph's /browse page
-        // mixes them in and they were getting picked, leading to wrong-book editions.
-        return results
-          .filter((r) => r.bookUrl.includes('/books/'))
-          .map((r) => ({
-            ...r,
-            bookUrl: r.bookUrl.startsWith('/')
-              ? `https://app.thestorygraph.com${r.bookUrl}`
-              : r.bookUrl,
-          }));
+        // Prefix relative URLs
+        return results.map((r) => ({
+          ...r,
+          bookUrl: r.bookUrl.startsWith('/')
+            ? `https://app.thestorygraph.com${r.bookUrl}`
+            : r.bookUrl,
+        }));
       });
     },
 
