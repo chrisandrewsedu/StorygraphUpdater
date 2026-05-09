@@ -3,3 +3,6 @@ dist/
 data/
 .env
 *.js.map
+.DS_Store
+.claude/
+docs/superpowers/
