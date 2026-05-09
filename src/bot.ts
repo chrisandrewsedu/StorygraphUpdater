@@ -170,7 +170,7 @@ export function createBot(options: CreateBotOptions): Bot {
       '/reading <title> — mark a book as currently reading on StoryGraph',
       '/finished <title> — mark a book as read on StoryGraph',
       '/dnf <title> — mark a book as Did Not Finish on StoryGraph',
-      '/link <title> — link an ABS book to a StoryGraph edition',
+      '/link [title] — link an in-progress ABS book to StoryGraph (no title shows a picker)',
     ].join('\n'));
   });
 
@@ -380,12 +380,35 @@ export function createBot(options: CreateBotOptions): Bot {
     }
   });
 
-  // ── /link <title> — two-step: pick book → pick edition ──────────────────────
+  // ── /link [title] — no args: pick from in-progress list; with args: search by title ──
 
-  bot.onText(/^\/link (.+)/, async (msg, match) => {
+  bot.onText(/^\/link(?:\s+(.+))?$/, async (msg, match) => {
     if (!isAuthorized(msg)) return;
-    const query = match?.[1]?.trim();
-    if (!query) { await reply(msg.chat.id, 'Usage: /link <ABS book title>'); return; }
+    const query = match?.[1]?.trim() || '';
+
+    if (!query) {
+      // No argument — show all in-progress ABS books as selectable buttons
+      try {
+        const booksInProgress = await absClient.getItemsInProgress();
+        if (booksInProgress.length === 0) {
+          await reply(msg.chat.id, 'No books currently in progress in Audiobookshelf.');
+          return;
+        }
+
+        const keyboard = booksInProgress.map((b) => [{
+          text: b.title,
+          callback_data: `lk_start:${b.absLibraryItemId}`,
+        }]);
+
+        await reply(msg.chat.id, 'Which in-progress book would you like to link to StoryGraph?', {
+          reply_markup: { inline_keyboard: keyboard },
+        });
+      } catch (err) {
+        logger.error('/link ABS fetch error', err);
+        await reply(msg.chat.id, `Failed to fetch ABS books: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      return;
+    }
 
     let absBook: AbsBookProgress | null = null;
     try {
@@ -400,36 +423,11 @@ export function createBot(options: CreateBotOptions): Bot {
     }
 
     if (!absBook) {
-      await reply(msg.chat.id, `No in-progress ABS book found matching: *${query}*\n\nUse /status to see in-progress books.`);
+      await reply(msg.chat.id, `No in-progress ABS book found matching: *${escapeMd(query)}*\n\nUse /link (no arguments) to see all in-progress books.`);
       return;
     }
 
-    const absId = absBook.absLibraryItemId;
-    await reply(msg.chat.id, `Found ABS book: *${absBook.title}*\n\nSearching StoryGraph...`);
-
-    try {
-      const results = await storygraph.searchBooks(absBook.title);
-      if (results.length === 0) {
-        await reply(msg.chat.id, 'No StoryGraph results found. Try /search with different terms.');
-        return;
-      }
-
-      // Step 1: Pick the book (deduplicated by title+author)
-      const seen = new Set<string>();
-      const deduped = results.filter((r) => {
-        const key = `${r.title}::${r.author}`.toLowerCase();
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      });
-
-      await sendSearchResults(msg.chat.id, deduped.slice(0, 3),
-        (r) => `lk_bk:${absId}:${cacheUrl(r.bookUrl)}`,
-        `Step 1: Pick the correct book:`);
-    } catch (err) {
-      logger.error('/link search error', err);
-      await reply(msg.chat.id, `Search failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
+    await startLinkFlow(msg.chat.id, absBook);
   });
 
   // ── Callback query handler ───────────────────────────────────────────────────
@@ -845,6 +843,22 @@ export function createBot(options: CreateBotOptions): Bot {
       return;
     }
 
+    // lk_start:<absId> → /link no-arg: user picked a book from the list
+    if (data.startsWith('lk_start:')) {
+      const absId = data.slice(9);
+      let absBook: AbsBookProgress | undefined;
+      try {
+        const booksInProgress = await absClient.getItemsInProgress();
+        absBook = booksInProgress.find((b) => b.absLibraryItemId === absId);
+      } catch (err) {
+        await reply(cid, `Failed to fetch ABS books: ${err instanceof Error ? err.message : String(err)}`);
+        return;
+      }
+      if (!absBook) { await reply(cid, 'Book not found in ABS — it may no longer be in progress.'); return; }
+      await startLinkFlow(cid, absBook);
+      return;
+    }
+
     // nby:<absId>:<urlId> — new book auto-link
     if (data.startsWith('nby:')) {
       const rest = data.slice(4);
@@ -876,12 +890,41 @@ export function createBot(options: CreateBotOptions): Bot {
 
     // nbs:<absId> — skip new book
     if (data.startsWith('nbs:')) {
-      await reply(cid, `Skipped. Use /link to connect this book later.`);
+      await reply(cid, `Skipped. Use /link to connect this book later.`, {
+        reply_markup: {
+          inline_keyboard: [[{ text: 'Link it now', callback_data: `lk_start:${data.slice(4)}` }]],
+        },
+      });
       return;
     }
   });
 
   // ── Internal helpers ────────────────────────────────────────────────────────
+
+  async function startLinkFlow(chatIdTarget: string | number, absBook: AbsBookProgress): Promise<void> {
+    const absId = absBook.absLibraryItemId;
+    await reply(chatIdTarget, `Found ABS book: *${escapeMd(absBook.title)}*\n\nSearching StoryGraph...`);
+    try {
+      const results = await storygraph.searchBooks(absBook.title);
+      if (results.length === 0) {
+        await reply(chatIdTarget, 'No StoryGraph results found. Try /search with different terms.');
+        return;
+      }
+      const seen = new Set<string>();
+      const deduped = results.filter((r) => {
+        const key = `${r.title}::${r.author}`.toLowerCase();
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+      await sendSearchResults(chatIdTarget, deduped.slice(0, 3),
+        (r) => `lk_bk:${absId}:${cacheUrl(r.bookUrl)}`,
+        `Step 1: Pick the correct book:`);
+    } catch (err) {
+      logger.error('startLinkFlow search error', err);
+      await reply(chatIdTarget, `Search failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
 
   async function promptNewBookInternal(book: AbsBookProgress): Promise<void> {
     logger.info(`Prompting for new book: ${book.title}`);
