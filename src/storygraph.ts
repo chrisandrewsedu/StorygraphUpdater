@@ -276,13 +276,16 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
           });
         });
 
-        // Prefix relative URLs
-        return results.map((r) => ({
-          ...r,
-          bookUrl: r.bookUrl.startsWith('/')
-            ? `https://app.thestorygraph.com${r.bookUrl}`
-            : r.bookUrl,
-        }));
+        // Drop non-book results (series, author, etc.) — StoryGraph's /browse page
+        // mixes them in and they were getting picked, leading to wrong-book editions.
+        return results
+          .filter((r) => r.bookUrl.includes('/books/'))
+          .map((r) => ({
+            ...r,
+            bookUrl: r.bookUrl.startsWith('/')
+              ? `https://app.thestorygraph.com${r.bookUrl}`
+              : r.bookUrl,
+          }));
       });
     },
 
