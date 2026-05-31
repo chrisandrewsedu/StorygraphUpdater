@@ -10,6 +10,30 @@ export interface AbsBookProgress {
   isFinished: boolean;
   lastUpdate: number;
   coverPath: string | null;
+  asin: string | null;
+  isbn: string | null;
+}
+
+/** A single Audiobookshelf listening session (from /api/me/listening-sessions). */
+export interface AbsListeningSession {
+  id: string;
+  libraryItemId: string;
+  date: string; // 'YYYY-MM-DD' (ABS local day)
+  dayOfWeek: string;
+  timeListening: number; // seconds listened during this session
+  startTime: number; // playback position at session start (sec)
+  currentTime: number; // playback position at session update (sec)
+  duration: number; // total media duration (sec)
+  startedAt: number;
+  updatedAt: number;
+}
+
+/** Cumulative listening progress reached by the end of a given day. */
+export interface AbsDayProgress {
+  date: string; // 'YYYY-MM-DD'
+  cumulativeSeconds: number; // furthest position reached by end of day
+  cumulativeMinutes: number; // floor(cumulativeSeconds / 60)
+  minutesThatDay: number; // delta vs the previous retained day
 }
 
 interface AbsMediaProgress {
@@ -28,14 +52,58 @@ interface AbsLibraryItem {
     metadata: {
       title: string;
       authorName: string;
+      asin?: string | null;
+      isbn?: string | null;
     };
     duration: number;
     coverPath: string | null;
   };
 }
 
+interface AbsListeningSessionsResponse {
+  total: number;
+  numPages: number;
+  page: number;
+  itemsPerPage: number;
+  sessions: AbsListeningSession[];
+}
+
 export interface AbsClient {
   getItemsInProgress(): Promise<AbsBookProgress[]>;
+  getListeningSessions(libraryItemId: string): Promise<AbsListeningSession[]>;
+}
+
+/**
+ * Reduce raw listening sessions into one cumulative-progress point per day,
+ * sorted chronologically. Takes the furthest position reached on each day,
+ * clamps the cumulative series to be monotonically non-decreasing (StoryGraph
+ * requires increasing progress), and drops days with no forward progress.
+ */
+export function reduceSessionsToDailyProgress(
+  sessions: AbsListeningSession[]
+): AbsDayProgress[] {
+  const maxByDate = new Map<string, number>();
+  for (const s of sessions) {
+    const prev = maxByDate.get(s.date) ?? 0;
+    if (s.currentTime > prev) maxByDate.set(s.date, s.currentTime);
+  }
+
+  const dates = [...maxByDate.keys()].sort();
+  const result: AbsDayProgress[] = [];
+  let prevCumulativeMinutes = 0;
+  let prevCumulativeSeconds = 0;
+
+  for (const date of dates) {
+    const cumulativeSeconds = Math.max(maxByDate.get(date)!, prevCumulativeSeconds);
+    const cumulativeMinutes = Math.floor(cumulativeSeconds / 60);
+    const minutesThatDay = cumulativeMinutes - prevCumulativeMinutes;
+    if (minutesThatDay <= 0) continue; // no forward progress this day
+    result.push({ date, cumulativeSeconds, cumulativeMinutes, minutesThatDay });
+    prevCumulativeMinutes = cumulativeMinutes;
+    prevCumulativeSeconds = cumulativeSeconds;
+  }
+
+  return result;
 }
 
 export function createAbsClient(baseUrl: string, apiToken: string): AbsClient {
@@ -83,8 +151,28 @@ export function createAbsClient(baseUrl: string, apiToken: string): AbsClient {
             isFinished: progress?.isFinished ?? false,
             lastUpdate: progress?.lastUpdate ?? 0,
             coverPath: item.media.coverPath,
+            asin: item.media.metadata.asin ?? null,
+            isbn: item.media.metadata.isbn ?? null,
           };
         });
+    },
+
+    async getListeningSessions(libraryItemId: string): Promise<AbsListeningSession[]> {
+      const itemsPerPage = 100;
+      const all: AbsListeningSession[] = [];
+      let page = 0;
+      let numPages = 1;
+      do {
+        const res = await apiFetch<AbsListeningSessionsResponse>(
+          `/api/me/listening-sessions?itemsPerPage=${itemsPerPage}&page=${page}`
+        );
+        numPages = res.numPages;
+        all.push(...res.sessions);
+        page++;
+      } while (page < numPages);
+
+      // The endpoint is user-global; keep only this book's sessions.
+      return all.filter((s) => s.libraryItemId === libraryItemId);
     },
   };
 }

@@ -3,7 +3,7 @@ import { logger } from './logger.js';
 import type { Database } from './db.js';
 import type { StoryGraph, StoryGraphSearchResult, StoryGraphEdition } from './storygraph.js';
 import type { AbsClient, AbsBookProgress } from './abs-client.js';
-import { runSync, type SyncResult } from './sync.js';
+import { runSync, backfillMapping, type SyncResult } from './sync.js';
 
 export interface Bot {
   start(): void;
@@ -171,6 +171,7 @@ export function createBot(options: CreateBotOptions): Bot {
       '/finished <title> — mark a book as read on StoryGraph',
       '/dnf <title> — mark a book as Did Not Finish on StoryGraph',
       '/link [title] — link an in-progress ABS book to StoryGraph (no title shows a picker)',
+      '/backfill [title] — rebuild StoryGraph journal history from ABS listening sessions',
     ].join('\n'));
   });
 
@@ -226,6 +227,40 @@ export function createBot(options: CreateBotOptions): Bot {
     } catch (err) {
       logger.error('/sync error', err);
       await reply(msg.chat.id, `Sync failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  });
+
+  // ── /backfill [title] — rebuild StoryGraph journal history from ABS sessions ──
+  bot.onText(/^\/backfill(?:\s+(.+))?$/, async (msg, match) => {
+    if (!isAuthorized(msg)) return;
+    const query = match?.[1]?.trim();
+    const mappings = db.getAllBookMappings();
+    const targets = query
+      ? mappings.filter((m) => m.title.toLowerCase().includes(query.toLowerCase()))
+      : mappings;
+    if (targets.length === 0) {
+      await reply(msg.chat.id, query ? `No linked book matches *${escapeMd(query)}*.` : `No linked books to backfill.`);
+      return;
+    }
+    await reply(msg.chat.id, `Backfilling ${targets.length} book(s) from Audiobookshelf history...`);
+
+    // ABS only returns in-progress items; use their isFinished flag where available.
+    let inProgress: AbsBookProgress[] = [];
+    try {
+      inProgress = await absClient.getItemsInProgress();
+    } catch (err) {
+      logger.warn(`/backfill: could not fetch ABS progress: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    const finishedById = new Map(inProgress.map((b) => [b.absLibraryItemId, b.isFinished]));
+
+    for (const mapping of targets) {
+      try {
+        const isFinished = finishedById.get(mapping.absLibraryItemId) ?? false;
+        const results = await backfillMapping(absClient, db, storygraph, mapping, isFinished);
+        await reply(msg.chat.id, summarizeBackfill(results, mapping.title));
+      } catch (err) {
+        await reply(msg.chat.id, `⚠️ *${escapeMd(mapping.title)}*: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
   });
 
@@ -471,15 +506,7 @@ export function createBot(options: CreateBotOptions): Bot {
         if (filteredAudio.length === 0) {
           if (allEditions.length === 0) {
             await reply(cid, `No editions found. Linking directly...`);
-            db.upsertBookMapping({
-              absLibraryItemId: absId,
-              storygraphBookUrl: bookUrl,
-              title: absBook?.title ?? absId,
-              author: absBook?.author ?? '',
-              editionType: 'audio',
-            });
-            await storygraph.markAsReading(bookUrl).catch((e) => logger.warn(`markAsReading failed: ${e.message}`));
-            await reply(cid, `Linked *${absBook?.title ?? absId}* to StoryGraph and marked as currently reading!\n${bookUrl}`);
+            await finishLink(cid, absId, absBook, bookUrl);
           } else {
             await reply(cid, `No audiobook editions found. Showing first 3 of ${allEditions.length} editions:`);
             await sendEditionResults(cid, allEditions.slice(0, 3),
@@ -492,15 +519,8 @@ export function createBot(options: CreateBotOptions): Bot {
         if (filteredAudio.length === 1) {
           const edition = filteredAudio[0];
           const editionUrl = edition.bookUrl || bookUrl;
-          db.upsertBookMapping({
-            absLibraryItemId: absId,
-            storygraphBookUrl: editionUrl,
-            title: absBook?.title ?? absId,
-            author: absBook?.author ?? '',
-            editionType: 'audio',
-          });
-          await storygraph.markAsReading(editionUrl).catch((e) => logger.warn(`markAsReading failed: ${e.message}`));
-          await reply(cid, `Found one audiobook edition — auto-linked and marked as currently reading!\n*${absBook?.title ?? absId}*\n${edition.info}\n${editionUrl}`);
+          await reply(cid, `Found one audiobook edition — auto-linking.\n${edition.info}`);
+          await finishLink(cid, absId, absBook, editionUrl);
           return;
         }
 
@@ -531,15 +551,7 @@ export function createBot(options: CreateBotOptions): Bot {
         await reply(cid, `Failed to load editions: ${err instanceof Error ? err.message : String(err)}\n\nLinking to the main book page instead.`);
         const booksInProgress = await absClient.getItemsInProgress();
         const absBook = booksInProgress.find((b) => b.absLibraryItemId === absId);
-        db.upsertBookMapping({
-          absLibraryItemId: absId,
-          storygraphBookUrl: bookUrl,
-          title: absBook?.title ?? absId,
-          author: absBook?.author ?? '',
-          editionType: 'audio',
-        });
-        await storygraph.markAsReading(bookUrl).catch((e) => logger.warn(`markAsReading failed: ${e.message}`));
-        await reply(cid, `Linked *${absBook?.title ?? absId}* to StoryGraph and marked as currently reading!\n${bookUrl}`);
+        await finishLink(cid, absId, absBook, bookUrl);
       }
       return;
     }
@@ -590,15 +602,7 @@ export function createBot(options: CreateBotOptions): Bot {
       try {
         const booksInProgress = await absClient.getItemsInProgress();
         const absBook = booksInProgress.find((b) => b.absLibraryItemId === absId);
-        db.upsertBookMapping({
-          absLibraryItemId: absId,
-          storygraphBookUrl: bookUrl,
-          title: absBook?.title ?? absId,
-          author: absBook?.author ?? '',
-          editionType: 'audio',
-        });
-        await storygraph.markAsReading(bookUrl);
-        await reply(cid, `✅ Linked *${absBook?.title ?? absId}* to StoryGraph and marked as currently reading!\n${bookUrl}`);
+        await finishLink(cid, absId, absBook, bookUrl);
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
         await reply(cid, `❌ Failed to link: ${errMsg}`);
@@ -873,15 +877,7 @@ export function createBot(options: CreateBotOptions): Bot {
       try {
         const booksInProgress = await absClient.getItemsInProgress();
         const absBook = booksInProgress.find((b) => b.absLibraryItemId === absId);
-        db.upsertBookMapping({
-          absLibraryItemId: absId,
-          storygraphBookUrl: bookUrl,
-          title: absBook?.title ?? absId,
-          author: absBook?.author ?? '',
-          editionType: 'audio',
-        });
-        await storygraph.markAsReading(bookUrl);
-        await reply(cid, `Linked and marked as currently reading!\n*${absBook?.title ?? absId}*\n${bookUrl}`);
+        await finishLink(cid, absId, absBook, bookUrl);
       } catch (err) {
         await reply(cid, `Failed: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -917,12 +913,81 @@ export function createBot(options: CreateBotOptions): Bot {
         seen.add(key);
         return true;
       });
+
+      // Auto-match by ASIN/ISBN first: if the top result has an edition whose
+      // identifier matches ABS's, link it directly. (Often misses for audiobooks,
+      // since ABS frequently carries the print ISBN — falls back to manual pick.)
+      const identifier = absBook.asin || absBook.isbn;
+      if (identifier && deduped.length > 0) {
+        try {
+          const match = await storygraph.findEditionByIdentifier(deduped[0].bookUrl, identifier);
+          if (match) {
+            await reply(chatIdTarget, `🔎 Auto-matched by ${absBook.asin ? 'ASIN' : 'ISBN'} \`${escapeMd(identifier)}\` → ${match.format} edition.`);
+            await finishLink(chatIdTarget, absId, absBook, match.bookUrl);
+            return;
+          }
+        } catch (e) {
+          logger.warn(`identifier auto-match failed: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+
       await sendSearchResults(chatIdTarget, deduped.slice(0, 3),
         (r) => `lk_bk:${absId}:${cacheUrl(r.bookUrl)}`,
         `Step 1: Pick the correct book:`);
     } catch (err) {
       logger.error('startLinkFlow search error', err);
       await reply(chatIdTarget, `Search failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** Summarize a backfill/reconcile result set into a single Telegram message. */
+  function summarizeBackfill(results: SyncResult[], title: string): string {
+    const writes = results.filter((r) => r.action === 'journal_write' && r.success).length;
+    const fixes = results.filter((r) => r.action === 'journal_fix' && r.success).length;
+    const read = results.some((r) => r.action === 'mark_read' && r.success);
+    const fails = results.filter((r) => !r.success);
+    let msg = `📚 *${escapeMd(title)}* — ${writes} day(s) written`;
+    if (fixes) msg += `, ${fixes} corrected`;
+    if (read) msg += `, marked read`;
+    if (!writes && !fixes && !read && !fails.length) msg += ` (already up to date)`;
+    if (fails.length) msg += `\n⚠️ ${fails.length} failed: ${escapeMd(fails.slice(0, 3).map((f) => f.error ?? '').join('; '))}`;
+    return msg;
+  }
+
+  /**
+   * Persist a mapping (with ASIN/ISBN), mark the book currently-reading on
+   * StoryGraph, then backfill its full listening history. Shared by every /link
+   * completion path so journal history is built immediately on linking.
+   */
+  async function finishLink(
+    cid: string | number,
+    absId: string,
+    absBook: AbsBookProgress | undefined,
+    storygraphBookUrl: string
+  ): Promise<void> {
+    db.upsertBookMapping({
+      absLibraryItemId: absId,
+      storygraphBookUrl,
+      title: absBook?.title ?? absId,
+      author: absBook?.author ?? '',
+      editionType: 'audio',
+      asin: absBook?.asin ?? null,
+      isbn: absBook?.isbn ?? null,
+    });
+    await storygraph
+      .markAsReading(storygraphBookUrl)
+      .catch((e) => logger.warn(`markAsReading failed: ${e instanceof Error ? e.message : String(e)}`));
+    await reply(
+      cid,
+      `✅ Linked *${escapeMd(absBook?.title ?? absId)}* and marked as currently reading.\n${storygraphBookUrl}\n\n⏳ Backfilling listening history from Audiobookshelf…`
+    );
+    const mapping = db.getBookMappingByAbsId(absId);
+    if (!mapping) return;
+    try {
+      const results = await backfillMapping(absClient, db, storygraph, mapping, absBook?.isFinished ?? false);
+      await reply(cid, summarizeBackfill(results, absBook?.title ?? absId));
+    } catch (err) {
+      await reply(cid, `⚠️ Backfill error: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -940,7 +1005,7 @@ export function createBot(options: CreateBotOptions): Bot {
       await reply(chatId, `New audiobook detected: *${book.title}* by ${book.author}\nProgress: ${book.progressPercent.toFixed(1)}%\n\nWhich StoryGraph entry matches? Selecting will link it and mark as currently reading.`);
 
       await sendSearchResults(chatId, top3,
-        (r) => `nby:${book.absLibraryItemId}:${cacheUrl(r.bookUrl)}`,
+        (r) => `lk_bk:${book.absLibraryItemId}:${cacheUrl(r.bookUrl)}`,
         '');
 
       await reply(chatId, 'Or skip for now:', {

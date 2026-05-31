@@ -17,6 +17,69 @@ export interface StoryGraphEdition {
   info: string;          // e.g. "305 pages • hardcover • 2017"
   bookUrl: string;
   coverUrl: string;
+  isbn: string | null;   // the "ISBN/UID:" value on the edition card (ISBN or ASIN)
+}
+
+/** Normalize an ISBN/ASIN for comparison: drop non-alphanumerics, uppercase. */
+export function normalizeIdentifier(id: string | null | undefined): string {
+  return (id ?? '').replace(/[^a-z0-9]/gi, '').toUpperCase();
+}
+
+/** Find the edition whose ISBN/ASIN matches `identifier` (formatting-insensitive). */
+export function matchEditionByIdentifier(
+  editions: StoryGraphEdition[],
+  identifier: string | null | undefined
+): StoryGraphEdition | null {
+  const norm = normalizeIdentifier(identifier);
+  if (!norm) return null;
+  return editions.find((e) => normalizeIdentifier(e.isbn) === norm) ?? null;
+}
+
+/** A reading-progress entry read from a StoryGraph journal page. */
+export interface StoryGraphJournalEntry {
+  entryId: string | null; // the /journal_entries/<id> UUID, if an Edit link was present
+  date: string; // 'YYYY-MM-DD'
+  minutes: number | null; // cumulative minutes listened, if this is an audiobook progress entry
+  percent: number | null;
+}
+
+/** Extract the book UUID from a StoryGraph `/books/<id>` URL, or null. */
+export function bookIdFromUrl(bookUrl: string): string | null {
+  return bookUrl.match(/\/books\/([0-9a-f]{8}-[0-9a-f-]+)/i)?.[1] ?? null;
+}
+
+const MONTHS = [
+  'january', 'february', 'march', 'april', 'may', 'june',
+  'july', 'august', 'september', 'october', 'november', 'december',
+];
+
+/**
+ * Parse one journal entry's row text (and its Edit link) into structured data.
+ * Rows look like "16 April 2026 Edit 16% 64 minutes listened (01:04 out of 06:41)"
+ * or "15 April 2026 Edit Started reading". Returns null if no date is present.
+ */
+export function parseJournalEntryRow(
+  rowText: string,
+  editHref: string | null
+): StoryGraphJournalEntry | null {
+  const dateMatch = rowText.match(
+    /(\d{1,2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})/i
+  );
+  if (!dateMatch) return null;
+  const day = String(dateMatch[1]).padStart(2, '0');
+  const month = String(MONTHS.indexOf(dateMatch[2].toLowerCase()) + 1).padStart(2, '0');
+  const date = `${dateMatch[3]}-${month}-${day}`;
+
+  const minutesMatch = rowText.match(/(\d+)\s+minutes?\s+listened/i);
+  const percentMatch = rowText.match(/(\d+)\s*%/);
+  const entryId = editHref?.match(/\/journal_entries\/([0-9a-f-]+)/i)?.[1] ?? null;
+
+  return {
+    entryId,
+    date,
+    minutes: minutesMatch ? parseInt(minutesMatch[1], 10) : null,
+    percent: percentMatch ? parseInt(percentMatch[1], 10) : null,
+  };
 }
 
 export interface StoryGraphBook {
@@ -30,6 +93,18 @@ export interface StoryGraph {
   isLoggedIn(): Promise<boolean>;
   searchBooks(query: string): Promise<StoryGraphSearchResult[]>;
   getEditions(bookUrl: string): Promise<StoryGraphEdition[]>;
+  /** Find the edition of `bookUrl` whose ISBN/ASIN matches `identifier`, or null. */
+  findEditionByIdentifier(bookUrl: string, identifier: string): Promise<StoryGraphEdition | null>;
+  /** Read the dated progress (journal) entries currently on StoryGraph for a book. */
+  getJournalEntries(bookUrl: string): Promise<StoryGraphJournalEntry[]>;
+  /** Create a backdated journal entry (cumulative minutes) for a past date. */
+  addBackdatedProgress(bookUrl: string, date: string, minutes: number): Promise<void>;
+  /** Set the cumulative minutes (and date) on an existing journal entry via the edit endpoint. */
+  setEntryMinutes(entryId: string, date: string, minutes: number): Promise<void>;
+  /** Delete a journal entry by id (used to repair a mismatched day before recreating it). */
+  deleteJournalEntry(entryId: string): Promise<void>;
+  /** Trigger StoryGraph's "Recalculate Streak" after backdated writes (best-effort). */
+  recalculateStreak(): Promise<void>;
   updateProgress(bookUrl: string, percent: number): Promise<void>;
   markAsReading(bookUrl: string): Promise<void>;
   markAsRead(bookUrl: string): Promise<void>;
@@ -181,7 +256,7 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
     await page.screenshot({ path: path.join(screenshotsDir, screenshotName), fullPage: false });
   }
 
-  return {
+  const api: StoryGraph = {
     async login(email: string, password: string): Promise<boolean> {
       return withRetry('login', async () => {
         const loginUrl = 'https://app.thestorygraph.com/users/sign_in';
@@ -323,7 +398,7 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
 
         // Parse editions — the editions page has rich cards with "Format:", "ISBN/UID:", etc.
         const editions = await page.evaluate(() => {
-          const results: Array<{title: string; format: string; info: string; bookUrl: string; coverUrl: string}> = [];
+          const results: Array<{title: string; format: string; info: string; bookUrl: string; coverUrl: string; isbn: string | null}> = [];
 
           // Each edition card contains: cover img, title, author, "Xpages • format • year",
           // and labeled fields like "Format: Audio", "ISBN/UID: ...", "Publisher: ..."
@@ -369,9 +444,13 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
               const pubMatch = cardText.match(/Publisher:\s*(.+?)(?:\n|$)/);
               const publisher = pubMatch ? pubMatch[1].trim() : '';
 
+              // Extract ISBN/UID (may be an ISBN-13/10 or an Amazon ASIN)
+              const isbnMatch = cardText.match(/ISBN\/UID:\s*([\w-]+)/);
+              const isbn = isbnMatch ? isbnMatch[1].trim() : null;
+
               const fullInfo = [info, publisher ? `Publisher: ${publisher}` : ''].filter(Boolean).join('\n');
 
-              results.push({ title, format, info: fullInfo, bookUrl, coverUrl });
+              results.push({ title, format, info: fullInfo, bookUrl, coverUrl, isbn });
             }
           }
 
@@ -395,7 +474,9 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
               const card = el.parentElement?.parentElement;
               const imgEl = card?.querySelector('img');
               const coverUrl = imgEl?.getAttribute('src') || '';
-              results.push({ title, format, info, bookUrl, coverUrl });
+              const isbnMatch = fullText.match(/ISBN\/UID:\s*([\w-]+)/);
+              const isbn = isbnMatch ? isbnMatch[1].trim() : null;
+              results.push({ title, format, info, bookUrl, coverUrl, isbn });
             }
           }
 
@@ -888,8 +969,224 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
       });
     },
 
+    async findEditionByIdentifier(
+      bookUrl: string,
+      identifier: string
+    ): Promise<StoryGraphEdition | null> {
+      const editions = await api.getEditions(bookUrl);
+      return matchEditionByIdentifier(editions, identifier);
+    },
+
+    async getJournalEntries(bookUrl: string): Promise<StoryGraphJournalEntry[]> {
+      return withRetry('getJournalEntries', async () => {
+        const bookId = bookIdFromUrl(bookUrl);
+        if (!bookId) throw new Error(`Cannot extract book id from ${bookUrl}`);
+        const url = `https://app.thestorygraph.com/journal?book_id=${bookId}`;
+        logger.info(`StoryGraph getJournalEntries: ${url}`);
+        await page.goto(url, { waitUntil: 'networkidle2', timeout: 20000 });
+        await handleTurnstile(url);
+        // Journal can lazy-load; scroll to surface all of this book's entries.
+        for (let i = 0; i < 3; i++) {
+          await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+          await sleep(1000);
+        }
+
+        // Anchor on each entry's "Edit" link, then walk up to the smallest ancestor
+        // that carries the date — that isolates one entry's row text.
+        const rows = await page.evaluate(() => {
+          const out: Array<{ rowText: string; editHref: string | null }> = [];
+          const links = document.querySelectorAll('a[href*="/journal_entries/"][href*="/edit"]');
+          for (const link of links) {
+            const editHref = link.getAttribute('href');
+            let el: Element | null = link.parentElement;
+            let rowText = '';
+            for (let depth = 0; depth < 6 && el; depth++) {
+              const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+              if (/\b(19|20)\d{2}\b/.test(t) && t.length < 600) {
+                rowText = t;
+                break;
+              }
+              el = el.parentElement;
+            }
+            out.push({ rowText, editHref });
+          }
+          return out;
+        });
+
+        const seen = new Set<string>();
+        const entries: StoryGraphJournalEntry[] = [];
+        for (const r of rows) {
+          const entry = parseJournalEntryRow(r.rowText, r.editHref);
+          if (!entry) continue;
+          const key = entry.entryId ?? `${entry.date}:${entry.minutes}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          entries.push(entry);
+        }
+        logger.info(`getJournalEntries: parsed ${entries.length} entries for ${bookId}`);
+        return entries;
+      });
+    },
+
+    async deleteJournalEntry(entryId: string): Promise<void> {
+      return withRetry('deleteJournalEntry', async () => {
+        const url = `https://app.thestorygraph.com/journal_entries/${entryId}/edit`;
+        await page.goto(url, { waitUntil: 'networkidle2', timeout: 20000 });
+        await handleTurnstile(url);
+        const result = await page.evaluate(async (id: string) => {
+          const token =
+            document.querySelector('meta[name="csrf-token"]')?.getAttribute('content') ||
+            (document.querySelector('input[name="authenticity_token"]') as HTMLInputElement | null)?.value;
+          if (!token) return { ok: false, error: 'no CSRF token' };
+          const body = new URLSearchParams({ _method: 'delete', authenticity_token: token });
+          try {
+            const res = await fetch(`/journal_entries/${id}`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'X-CSRF-Token': token,
+                'X-Requested-With': 'XMLHttpRequest',
+                Accept: 'text/html, application/javascript',
+              },
+              body: body.toString(),
+              credentials: 'include',
+            });
+            return { ok: res.ok, status: res.status };
+          } catch (e: any) {
+            return { ok: false, error: e.message };
+          }
+        }, entryId);
+        logger.info(`deleteJournalEntry(${entryId}): ${JSON.stringify(result)}`);
+        if (!result.ok) throw new Error(`deleteJournalEntry failed: ${JSON.stringify(result)}`);
+      });
+    },
+
+    async recalculateStreak(): Promise<void> {
+      try {
+        await page.goto('https://app.thestorygraph.com/journal', { waitUntil: 'networkidle2', timeout: 20000 });
+        const result = await page.evaluate(async () => {
+          const token = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content');
+          // The flame/recalculate control posts to a recalculate endpoint when a streak breaks.
+          const el = [...document.querySelectorAll('a,button,form')].find((e) =>
+            /recalc/i.test((e.getAttribute('href') || '') + (e.getAttribute('action') || '') + (e.textContent || ''))
+          ) as HTMLElement | null;
+          if (!el) return { ok: false, error: 'no recalculate control found' };
+          const href = el.getAttribute('href') || el.getAttribute('action');
+          if (href && token) {
+            const res = await fetch(href, {
+              method: 'POST',
+              headers: { 'X-CSRF-Token': token, 'X-Requested-With': 'XMLHttpRequest', Accept: 'text/javascript' },
+              credentials: 'include',
+            });
+            return { ok: res.ok, status: res.status };
+          }
+          (el as HTMLElement).click();
+          return { ok: true, status: 'clicked' };
+        });
+        logger.info(`recalculateStreak: ${JSON.stringify(result)}`);
+      } catch (err) {
+        logger.warn(`recalculateStreak best-effort failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    },
+
+    async addBackdatedProgress(bookUrl: string, date: string, minutes: number): Promise<void> {
+      return withRetry('addBackdatedProgress', async () => {
+        // StoryGraph's "Add note/Edit date" form is JS-driven and the minutes field
+        // is unreliable to drive headlessly (HH:MM, overlay-covered, order-sensitive,
+        // and breaks on consecutive writes). The DATE selects, however, are reliable,
+        // and the journal-entry EDIT endpoint reliably sets the value as a plain
+        // minute count. So: (1) create the entry with the correct date (ignore the
+        // flaky minutes field), then (2) PUT the cumulative minutes onto it.
+        const bookId = bookIdFromUrl(bookUrl);
+        if (!bookId) throw new Error(`Cannot extract book id from ${bookUrl}`);
+        const formUrl = `https://app.thestorygraph.com/progress-update?book_id=${bookId}&return_to=${encodeURIComponent(bookUrl)}`;
+        const [year, month, day] = date.split('-').map((n) => String(parseInt(n, 10)));
+        const F = 'form[action="/update-progress-with-note"]';
+
+        // --- Step 1: create a dated entry (date selects are reliable) ---
+        await page.goto(formUrl, { waitUntil: 'networkidle2', timeout: 20000 });
+        await handleTurnstile(formUrl);
+        await page.waitForSelector(`${F} select[name="progress_update_date[day]"]`, { timeout: 8000 });
+        await page.select(`${F} select[name="progress_type"]`, 'minutes').catch(() => null);
+        await page.select(`${F} select[name="progress_update_date[day]"]`, day).catch(() => null);
+        await page.select(`${F} select[name="progress_update_date[month]"]`, month).catch(() => null);
+        await page.select(`${F} select[name="progress_update_date[year]"]`, year).catch(() => null);
+        await page.evaluate((sel: string) => {
+          const form = document.querySelector(sel) as HTMLFormElement | null;
+          if (!form) return;
+          form.noValidate = true; // the "href" link field is spuriously required
+          form.requestSubmit((form.querySelector('button[type="submit"]') as HTMLButtonElement | null) ?? undefined);
+        }, F);
+        await page
+          .waitForFunction(() => !location.pathname.includes('/progress-update'), { timeout: 12000 })
+          .catch(() => null);
+        await sleep(800);
+
+        // --- Step 2: find the just-created entry for this date and set its minutes ---
+        const entries = await api.getJournalEntries(bookUrl);
+        const target = entries.find((e) => e.date === date && e.entryId);
+        if (!target?.entryId) {
+          throw new Error(`addBackdatedProgress: created entry for ${date} not found to set minutes`);
+        }
+        await api.setEntryMinutes(target.entryId, date, minutes);
+        logger.info(`addBackdatedProgress(${date}, ${minutes}m): entry ${target.entryId}`);
+      });
+    },
+
+    async setEntryMinutes(entryId: string, date: string, minutes: number): Promise<void> {
+      return withRetry('setEntryMinutes', async () => {
+        const url = `https://app.thestorygraph.com/journal_entries/${entryId}/edit`;
+        await page.goto(url, { waitUntil: 'networkidle2', timeout: 20000 });
+        await handleTurnstile(url);
+        const [year, month, day] = date.split('-').map((n) => String(parseInt(n, 10)));
+        const result = await page.evaluate(
+          async (id: string, d: string, m: string, y: string, mins: number) => {
+            const token =
+              document.querySelector('meta[name="csrf-token"]')?.getAttribute('content') ||
+              (document.querySelector('input[name="authenticity_token"]') as HTMLInputElement | null)?.value;
+            if (!token) return { ok: false, error: 'no CSRF token' };
+            const body = new URLSearchParams({
+              _method: 'put',
+              authenticity_token: token,
+              'journal_entry[day]': d,
+              'journal_entry[month]': m,
+              'journal_entry[year]': y,
+              // The edit endpoint takes a plain minute count (unlike the create form's HH:MM).
+              'journal_entry[minutes_listened_total]': String(mins),
+              'journal_entry[minutes_listened]': String(mins),
+            });
+            try {
+              const res = await fetch(`/journal_entries/${id}`, {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/x-www-form-urlencoded',
+                  'X-CSRF-Token': token,
+                  'X-Requested-With': 'XMLHttpRequest',
+                  Accept: 'text/html, text/vnd.turbo-stream.html, application/javascript',
+                },
+                body: body.toString(),
+                credentials: 'include',
+              });
+              return { ok: res.ok, status: res.status };
+            } catch (e: any) {
+              return { ok: false, error: e.message };
+            }
+          },
+          entryId,
+          day,
+          month,
+          year,
+          minutes
+        );
+        logger.info(`setEntryMinutes(${entryId} -> ${date}, ${minutes}m): ${JSON.stringify(result)}`);
+        if (!result.ok) throw new Error(`setEntryMinutes failed: ${JSON.stringify(result)}`);
+      });
+    },
+
     async close(): Promise<void> {
       await browser.close();
     },
   };
+
+  return api;
 }
