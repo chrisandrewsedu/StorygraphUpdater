@@ -1,7 +1,7 @@
 import TelegramBot from 'node-telegram-bot-api';
 import { logger } from './logger.js';
 import type { Database } from './db.js';
-import type { StoryGraph, StoryGraphSearchResult, StoryGraphEdition } from './storygraph.js';
+import { matchShelfByTitle, type StoryGraph, type StoryGraphSearchResult, type StoryGraphEdition } from './storygraph.js';
 import type { AbsClient, AbsBookProgress } from './abs-client.js';
 import { runSync, backfillMapping, type SyncResult } from './sync.js';
 
@@ -863,6 +863,22 @@ export function createBot(options: CreateBotOptions): Bot {
       return;
     }
 
+    // lk_srch:<absId> → user declined the Currently-Reading-shelf match; search instead
+    if (data.startsWith('lk_srch:')) {
+      const absId = data.slice(8);
+      let absBook: AbsBookProgress | undefined;
+      try {
+        const booksInProgress = await absClient.getItemsInProgress();
+        absBook = booksInProgress.find((b) => b.absLibraryItemId === absId);
+      } catch (err) {
+        await reply(cid, `Failed to fetch ABS books: ${err instanceof Error ? err.message : String(err)}`);
+        return;
+      }
+      if (!absBook) { await reply(cid, 'Book not found in ABS — it may no longer be in progress.'); return; }
+      await searchAndOfferBooks(cid, absBook);
+      return;
+    }
+
     // nby:<absId>:<urlId> — new book auto-link
     if (data.startsWith('nby:')) {
       const rest = data.slice(4);
@@ -899,7 +915,40 @@ export function createBot(options: CreateBotOptions): Bot {
 
   async function startLinkFlow(chatIdTarget: string | number, absBook: AbsBookProgress): Promise<void> {
     const absId = absBook.absLibraryItemId;
-    await reply(chatIdTarget, `Found ABS book: *${escapeMd(absBook.title)}*\n\nSearching StoryGraph...`);
+    await reply(chatIdTarget, `Found ABS book: *${escapeMd(absBook.title)}*`);
+
+    // Check the user's "Currently Reading" shelf first — if the book is already
+    // there, link straight to it (that's the primary book id the journal uses)
+    // instead of making them pick from a long search list.
+    try {
+      const shelf = await storygraph.getCurrentlyReading(storygraphUsername);
+      const match = matchShelfByTitle(shelf, absBook.title);
+      if (match) {
+        await reply(
+          chatIdTarget,
+          `📖 *${escapeMd(match.title)}* is already on your StoryGraph *Currently Reading* shelf.`,
+          {
+            reply_markup: {
+              inline_keyboard: [
+                [{ text: '✅ Link to this & backfill', callback_data: `lk_ed:${absId}:${cacheUrl(match.bookUrl)}` }],
+                [{ text: '🔍 Search instead', callback_data: `lk_srch:${absId}` }],
+              ],
+            },
+          }
+        );
+        return;
+      }
+    } catch (e) {
+      logger.warn(`currently-reading shelf check failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+
+    await searchAndOfferBooks(chatIdTarget, absBook);
+  }
+
+  /** Search StoryGraph by title, try an ASIN/ISBN auto-match, else offer the top results. */
+  async function searchAndOfferBooks(chatIdTarget: string | number, absBook: AbsBookProgress): Promise<void> {
+    const absId = absBook.absLibraryItemId;
+    await reply(chatIdTarget, `Searching StoryGraph for *${escapeMd(absBook.title)}*...`);
     try {
       const results = await storygraph.searchBooks(absBook.title);
       if (results.length === 0) {

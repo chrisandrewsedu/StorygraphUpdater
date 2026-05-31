@@ -4,7 +4,10 @@ import {
   matchEditionByIdentifier,
   parseJournalEntryRow,
   bookIdFromUrl,
+  normalizeTitle,
+  matchShelfByTitle,
   type StoryGraphEdition,
+  type StoryGraphBook,
 } from '../src/storygraph.js';
 
 function edition(partial: Partial<StoryGraphEdition>): StoryGraphEdition {
@@ -96,5 +99,39 @@ describe('parseJournalEntryRow', () => {
 
   it('returns a null entryId when the edit href is missing', () => {
     expect(parseJournalEntryRow('16 April 2026 16%', null)?.entryId).toBeNull();
+  });
+});
+
+describe('normalizeTitle', () => {
+  it('drops subtitle, series, and punctuation', () => {
+    expect(normalizeTitle('Catching Fire')).toBe('catching fire');
+    expect(normalizeTitle('No Nonsense Spirituality: All the Tools')).toBe('no nonsense spirituality');
+    expect(normalizeTitle('Catching Fire (The Hunger Games, #2)')).toBe('catching fire');
+  });
+});
+
+describe('matchShelfByTitle', () => {
+  const book = (title: string, bookUrl: string): StoryGraphBook => ({ title, author: '', bookUrl });
+
+  it('matches an ABS title to a shelf book, ignoring subtitle/series', () => {
+    const shelf = [
+      book('A Calendar of Wisdom: Daily Thoughts', 'https://app.thestorygraph.com/books/cal'),
+      book('Catching Fire (The Hunger Games, #2)', 'https://app.thestorygraph.com/books/cf'),
+    ];
+    expect(matchShelfByTitle(shelf, 'Catching Fire')?.bookUrl).toBe('https://app.thestorygraph.com/books/cf');
+  });
+
+  it('treats duplicate shelf rows for the same book as a single confident match', () => {
+    const shelf = [book('Catching Fire', '/books/cf'), book('Catching Fire', '/books/cf')];
+    expect(matchShelfByTitle(shelf, 'Catching Fire')?.bookUrl).toBe('/books/cf');
+  });
+
+  it('returns null when nothing matches', () => {
+    expect(matchShelfByTitle([book('Dune', '/books/d')], 'Catching Fire')).toBeNull();
+  });
+
+  it('returns null when two different books share the title (ambiguous)', () => {
+    const shelf = [book('Catching Fire', '/books/a'), book('Catching Fire', '/books/b')];
+    expect(matchShelfByTitle(shelf, 'Catching Fire')).toBeNull();
   });
 });

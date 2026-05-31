@@ -48,6 +48,31 @@ export function bookIdFromUrl(bookUrl: string): string | null {
   return bookUrl.match(/\/books\/([0-9a-f]{8}-[0-9a-f-]+)/i)?.[1] ?? null;
 }
 
+/** Normalize a title for matching: lowercase, drop subtitle/series, strip punctuation. */
+export function normalizeTitle(title: string): string {
+  return (title || '')
+    .toLowerCase()
+    .split(/[:(]/)[0] // drop ": subtitle" and "(series, #n)"
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+/**
+ * Find the shelf book whose title matches `title` (subtitle/series-insensitive).
+ * Returns the book only on a CONFIDENT single match — null if nothing matches or
+ * two different books share the title.
+ */
+export function matchShelfByTitle(
+  books: StoryGraphBook[],
+  title: string
+): StoryGraphBook | null {
+  const norm = normalizeTitle(title);
+  if (!norm) return null;
+  const matches = books.filter((b) => normalizeTitle(b.title) === norm);
+  const uniqueUrls = new Set(matches.map((m) => m.bookUrl));
+  return uniqueUrls.size === 1 ? matches[0] : null;
+}
+
 const MONTHS = [
   'january', 'february', 'march', 'april', 'may', 'june',
   'july', 'august', 'september', 'october', 'november', 'december',
@@ -113,6 +138,8 @@ export interface StoryGraph {
   rateBook(bookUrl: string, wholeStars: number, fraction: 0 | 25 | 50 | 75): Promise<void>;
   addToTBR(bookUrl: string): Promise<void>;
   getTBRList(username: string): Promise<StoryGraphBook[]>;
+  /** Read the user's "currently reading" shelf (book title + primary book URL). */
+  getCurrentlyReading(username: string): Promise<StoryGraphBook[]>;
   close(): Promise<void>;
 }
 
@@ -966,6 +993,42 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
             ? `https://app.thestorygraph.com${b.bookUrl}`
             : b.bookUrl,
         }));
+      });
+    },
+
+    async getCurrentlyReading(username: string): Promise<StoryGraphBook[]> {
+      return withRetry('getCurrentlyReading', async () => {
+        const url = `https://app.thestorygraph.com/currently-reading/${username}`;
+        await page.goto(url, { waitUntil: 'networkidle2', timeout: 15000 });
+        await handleTurnstile(url);
+        for (let i = 0; i < 3; i++) {
+          await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+          await sleep(1000);
+        }
+        const books = await page.evaluate(() => {
+          const els = document.querySelectorAll('.book-title-author-and-series');
+          return Array.from(els).map((el) => {
+            // Prefer the /books/ link — these cards also contain series-tag anchors
+            // (/series/<id>), which must NOT be treated as books.
+            const linkEl = el.querySelector('a[href*="/books/"]') ?? el.querySelector('a');
+            return {
+              title: linkEl?.textContent?.trim() || '',
+              author: '',
+              bookUrl: linkEl?.getAttribute('href') || '',
+            };
+          });
+        });
+        // Keep only real book links, dedupe (the shelf renders each twice), absolutize.
+        const seen = new Set<string>();
+        const out: StoryGraphBook[] = [];
+        for (const b of books) {
+          if (!/\/books\/[0-9a-f-]{8,}/i.test(b.bookUrl)) continue; // drop series/other links
+          const bookUrl = b.bookUrl.startsWith('/') ? `https://app.thestorygraph.com${b.bookUrl}` : b.bookUrl;
+          if (seen.has(bookUrl)) continue;
+          seen.add(bookUrl);
+          out.push({ ...b, bookUrl });
+        }
+        return out;
       });
     },
 
