@@ -2,7 +2,7 @@ import { logger } from './logger.js';
 import { reduceSessionsToDailyProgress } from './abs-client.js';
 import type { AbsBookProgress, AbsClient, AbsDayProgress } from './abs-client.js';
 import type { Database, BookMapping } from './db.js';
-import type { StoryGraph } from './storygraph.js';
+import { chooseAudioEdition, type StoryGraph } from './storygraph.js';
 
 /** Minutes tolerance before an ABS↔StoryGraph day is treated as a mismatch (absorbs rounding). */
 const MISMATCH_TOLERANCE_MIN = 1;
@@ -82,7 +82,12 @@ export function diffDailyProgress(
   localWritten: { date: string; minutes: number }[],
   now: Date
 ): DailyDiff {
-  const existingByDate = new Map(existing.map((e) => [e.date, e.minutes]));
+  // A "Started reading" placeholder (null minutes) can share a date with a real entry —
+  // prefer the entry that carries minutes.
+  const existingByDate = new Map<string, number | null>();
+  for (const e of existing) {
+    if (e.minutes != null || !existingByDate.has(e.date)) existingByDate.set(e.date, e.minutes);
+  }
   const localDates = new Set(localWritten.map((l) => l.date));
 
   const toWrite: DailyDiff['toWrite'] = [];
@@ -117,6 +122,10 @@ export interface SyncResult {
   action: string;
   percent?: number;
   success: boolean;
+  /** For journal_write / journal_fix: the day and what was recorded on it. */
+  date?: string;
+  dayMinutes?: number;
+  totalMinutes?: number;
   error?: string;
   screenshotPath?: string;
 }
@@ -139,7 +148,10 @@ export async function reconcileBook(
   const url = mapping.storygraphBookUrl;
 
   const existing = (await storygraph.getJournalEntries(url)).filter(Boolean);
-  const existingByDate = new Map(existing.map((e) => [e.date, e]));
+  const existingByDate = new Map<string, (typeof existing)[number]>();
+  for (const e of existing) {
+    if (e.minutes != null || !existingByDate.has(e.date)) existingByDate.set(e.date, e);
+  }
   const localWritten = db
     .getJournalEntries(mapping.id)
     .filter((e) => e.status === 'success')
@@ -153,17 +165,38 @@ export async function reconcileBook(
   );
 
   let didWrite = false;
+  const dailyByDate = new Map(daily.map((d) => [d.date, d]));
+  const progressFor = (date: string, totalMinutes: number) => ({
+    totalMinutes,
+    dayMinutes: dailyByDate.get(date)?.minutesThatDay ?? 0,
+    percent: dailyByDate.get(date)?.percent ?? null,
+  });
+  const dayFields = (p: ReturnType<typeof progressFor>) => ({
+    dayMinutes: p.dayMinutes,
+    totalMinutes: p.totalMinutes,
+    percent: p.percent ?? undefined,
+  });
 
   // Promote to currently-reading before any journal write (StoryGraph requires it).
   if (diff.toWrite.length > 0) {
     await storygraph.markAsReading(url);
   }
 
+  // First backfill: StoryGraph dates "Started reading" on the day the book was shelved;
+  // move it to the first day actually listened in ABS. Later runs leave it alone.
+  if (localWritten.length === 0 && daily.length > 0 && diff.toWrite.length > 0) {
+    const firstDay = [...daily].sort((a, b) => a.date.localeCompare(b.date))[0].date;
+    await storygraph
+      .setStartDate(url, firstDay)
+      .catch((e) => logger.warn(`setStartDate(${firstDay}) failed: ${e instanceof Error ? e.message : String(e)}`));
+  }
+
   for (const w of diff.toWrite) {
     try {
-      await storygraph.addBackdatedProgress(url, w.date, w.minutes);
+      const progress = progressFor(w.date, w.minutes);
+      await storygraph.addBackdatedProgress(url, w.date, progress);
       db.upsertJournalEntry({ bookMappingId: mapping.id, entryDate: w.date, minutes: w.minutes, status: 'success' });
-      results.push({ book: mapping.title, action: 'journal_write', percent: undefined, success: true });
+      results.push({ book: mapping.title, action: 'journal_write', success: true, date: w.date, ...dayFields(progress) });
       didWrite = true;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -178,9 +211,10 @@ export async function reconcileBook(
     try {
       // ABS is authoritative: drop the stale entry and recreate it with the right value.
       await storygraph.deleteJournalEntry(entryId);
-      await storygraph.addBackdatedProgress(url, m.date, m.absMinutes);
+      const progress = progressFor(m.date, m.absMinutes);
+      await storygraph.addBackdatedProgress(url, m.date, progress);
       db.upsertJournalEntry({ bookMappingId: mapping.id, entryDate: m.date, minutes: m.absMinutes, status: 'success' });
-      results.push({ book: mapping.title, action: 'journal_fix', success: true });
+      results.push({ book: mapping.title, action: 'journal_fix', success: true, date: m.date, ...dayFields(progress) });
       didWrite = true;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -203,6 +237,46 @@ export async function reconcileBook(
   }
 
   return results;
+}
+
+/**
+ * Link an ABS book to StoryGraph. Journal minutes only stick on an AUDIO edition
+ * (a print edition records "0 pages"), and entries follow whichever edition is
+ * shelved — so resolve to the matching audio edition, switch the shelf to it,
+ * save the mapping and mark it currently reading. Returns the saved mapping.
+ */
+export async function linkBook(
+  db: Database,
+  storygraph: StoryGraph,
+  absId: string,
+  absBook: AbsBookProgress | undefined,
+  storygraphBookUrl: string
+): Promise<BookMapping> {
+  try {
+    const editions = await storygraph.getEditions(storygraphBookUrl);
+    const audioUrl = chooseAudioEdition(editions, storygraphBookUrl, { asin: absBook?.asin, isbn: absBook?.isbn });
+    if (audioUrl !== storygraphBookUrl) {
+      logger.info(`linkBook: using audio edition ${audioUrl} instead of ${storygraphBookUrl}`);
+      storygraphBookUrl = audioUrl;
+    }
+    await storygraph.switchToEdition(storygraphBookUrl);
+  } catch (e) {
+    logger.warn(`audio edition resolve/switch failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  db.upsertBookMapping({
+    absLibraryItemId: absId,
+    storygraphBookUrl,
+    title: absBook?.title ?? absId,
+    author: absBook?.author ?? '',
+    editionType: 'audio',
+    asin: absBook?.asin ?? null,
+    isbn: absBook?.isbn ?? null,
+  });
+  await storygraph
+    .markAsReading(storygraphBookUrl)
+    .catch((e) => logger.warn(`markAsReading failed: ${e instanceof Error ? e.message : String(e)}`));
+  return db.getBookMappingByAbsId(absId)!;
 }
 
 /**
@@ -291,6 +365,35 @@ export async function runSync(
     // Skip if already resolved
     const doneActions = ['mark_read', 'mark_dnf', 'finish_prompted'];
     if (lastSync && doneActions.includes(lastSync.action) && lastSync.status === 'success') continue;
+
+    // Finished in ABS (finished books drop out of items-in-progress): write the last
+    // listening days, then mark it finished on StoryGraph — no need to ask.
+    let finished = false;
+    try {
+      finished = await absClient.isItemFinished(mapping.absLibraryItemId);
+    } catch (err) {
+      logger.warn(`isItemFinished(${mapping.title}) failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    if (finished) {
+      try {
+        const bookResults = await backfillMapping(absClient, db, storygraph, mapping, true, now);
+        results.push(...bookResults);
+        const marked = bookResults.some((r) => r.action === 'mark_read' && r.success);
+        db.logSync({
+          bookMappingId: mapping.id,
+          progressPercent: 100,
+          action: 'mark_read',
+          status: marked ? 'success' : 'failed',
+          errorMessage: marked ? null : bookResults.find((r) => !r.success)?.error ?? 'mark_read failed',
+        });
+        logger.info(`${mapping.title} finished in ABS — ${marked ? 'marked finished on StoryGraph' : 'mark finished FAILED'}`);
+      } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        db.logSync({ bookMappingId: mapping.id, progressPercent: 100, action: 'mark_read', status: 'failed', errorMessage: errorMsg });
+        results.push({ book: mapping.title, action: 'mark_read', success: false, error: errorMsg });
+      }
+      continue;
+    }
 
     // Only skip on low progress if we have a record — if lastSync is null the book was
     // linked but finished before a progress sync could run, so we still want to prompt

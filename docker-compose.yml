@@ -1,6 +1,7 @@
 services:
   storygraph-updater:
     build: .
+    image: storygraph-updater  # same tag as `docker build -t storygraph-updater .` — one image, no stale copy
     container_name: storygraph-updater
     volumes:
       - ./data:/app/data

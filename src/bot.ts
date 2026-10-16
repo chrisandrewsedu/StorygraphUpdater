@@ -3,7 +3,8 @@ import { logger } from './logger.js';
 import type { Database } from './db.js';
 import { matchShelfByTitle, type StoryGraph, type StoryGraphSearchResult, type StoryGraphEdition } from './storygraph.js';
 import type { AbsClient, AbsBookProgress } from './abs-client.js';
-import { runSync, backfillMapping, type SyncResult } from './sync.js';
+import { runSync, backfillMapping, linkBook, type SyncResult } from './sync.js';
+import { escapeMd, formatBackfillSummary, formatDayLine } from './format.js';
 
 export interface Bot {
   start(): void;
@@ -55,10 +56,6 @@ export function createBot(options: CreateBotOptions): Bot {
   // ── Helper utilities ─────────────────────────────────────────────────────────
 
   /** Escape Telegram legacy Markdown special characters: _ * ` [ ] */
-  function escapeMd(text: string): string {
-    return text.replace(/([_*`\[\]])/g, '\\$1');
-  }
-
   async function reply(chatIdTarget: string | number, text: string, extra?: TelegramBot.SendMessageOptions): Promise<void> {
     try {
       await bot.sendMessage(chatIdTarget, text, { parse_mode: 'Markdown', ...extra });
@@ -257,7 +254,7 @@ export function createBot(options: CreateBotOptions): Bot {
       try {
         const isFinished = finishedById.get(mapping.absLibraryItemId) ?? false;
         const results = await backfillMapping(absClient, db, storygraph, mapping, isFinished);
-        await reply(msg.chat.id, summarizeBackfill(results, mapping.title));
+        await reply(msg.chat.id, formatBackfillSummary(results, mapping.title));
       } catch (err) {
         await reply(msg.chat.id, `⚠️ *${escapeMd(mapping.title)}*: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -989,20 +986,6 @@ export function createBot(options: CreateBotOptions): Bot {
     }
   }
 
-  /** Summarize a backfill/reconcile result set into a single Telegram message. */
-  function summarizeBackfill(results: SyncResult[], title: string): string {
-    const writes = results.filter((r) => r.action === 'journal_write' && r.success).length;
-    const fixes = results.filter((r) => r.action === 'journal_fix' && r.success).length;
-    const read = results.some((r) => r.action === 'mark_read' && r.success);
-    const fails = results.filter((r) => !r.success);
-    let msg = `📚 *${escapeMd(title)}* — ${writes} day(s) written`;
-    if (fixes) msg += `, ${fixes} corrected`;
-    if (read) msg += `, marked read`;
-    if (!writes && !fixes && !read && !fails.length) msg += ` (already up to date)`;
-    if (fails.length) msg += `\n⚠️ ${fails.length} failed: ${escapeMd(fails.slice(0, 3).map((f) => f.error ?? '').join('; '))}`;
-    return msg;
-  }
-
   /**
    * Persist a mapping (with ASIN/ISBN), mark the book currently-reading on
    * StoryGraph, then backfill its full listening history. Shared by every /link
@@ -1014,18 +997,8 @@ export function createBot(options: CreateBotOptions): Bot {
     absBook: AbsBookProgress | undefined,
     storygraphBookUrl: string
   ): Promise<void> {
-    db.upsertBookMapping({
-      absLibraryItemId: absId,
-      storygraphBookUrl,
-      title: absBook?.title ?? absId,
-      author: absBook?.author ?? '',
-      editionType: 'audio',
-      asin: absBook?.asin ?? null,
-      isbn: absBook?.isbn ?? null,
-    });
-    await storygraph
-      .markAsReading(storygraphBookUrl)
-      .catch((e) => logger.warn(`markAsReading failed: ${e instanceof Error ? e.message : String(e)}`));
+    const linked = await linkBook(db, storygraph, absId, absBook, storygraphBookUrl);
+    storygraphBookUrl = linked.storygraphBookUrl;
     await reply(
       cid,
       `✅ Linked *${escapeMd(absBook?.title ?? absId)}* and marked as currently reading.\n${storygraphBookUrl}\n\n⏳ Backfilling listening history from Audiobookshelf…`
@@ -1034,7 +1007,7 @@ export function createBot(options: CreateBotOptions): Bot {
     if (!mapping) return;
     try {
       const results = await backfillMapping(absClient, db, storygraph, mapping, absBook?.isFinished ?? false);
-      await reply(cid, summarizeBackfill(results, absBook?.title ?? absId));
+      await reply(cid, formatBackfillSummary(results, absBook?.title ?? absId));
     } catch (err) {
       await reply(cid, `⚠️ Backfill error: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -1137,7 +1110,17 @@ export function createBot(options: CreateBotOptions): Bot {
     }
 
     const lines: string[] = ['*Sync Summary*', ''];
+    // Journal days go under their book as a per-day list; other actions stay one line each.
+    const shownBooks = new Set<string>();
     for (const r of results) {
+      if ((r.action === 'journal_write' || r.action === 'journal_fix') && r.success) {
+        if (!shownBooks.has(r.book)) {
+          shownBooks.add(r.book);
+          lines.push(`✅ *${escapeMd(r.book)}* — listening days written:`);
+        }
+        lines.push(formatDayLine(r));
+        continue;
+      }
       const actionLabel = r.action.replace(/_/g, ' ');
       const percentStr = r.percent != null ? ` (${Math.round(r.percent)}%)` : '';
       lines.push(`${r.success ? '✅' : '❌'} *${escapeMd(r.book)}* — ${actionLabel}${percentStr}`);

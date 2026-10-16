@@ -34,6 +34,7 @@ export interface AbsDayProgress {
   cumulativeSeconds: number; // furthest position reached by end of day
   cumulativeMinutes: number; // floor(cumulativeSeconds / 60)
   minutesThatDay: number; // delta vs the previous retained day
+  percent: number | null; // % of the book reached by end of day (null if ABS has no duration)
 }
 
 interface AbsMediaProgress {
@@ -71,6 +72,8 @@ interface AbsListeningSessionsResponse {
 export interface AbsClient {
   getItemsInProgress(): Promise<AbsBookProgress[]>;
   getListeningSessions(libraryItemId: string): Promise<AbsListeningSession[]>;
+  /** True if ABS marks this item finished (finished items drop out of items-in-progress). */
+  isItemFinished(libraryItemId: string): Promise<boolean>;
 }
 
 /**
@@ -83,6 +86,7 @@ export function reduceSessionsToDailyProgress(
   sessions: AbsListeningSession[]
 ): AbsDayProgress[] {
   const maxByDate = new Map<string, number>();
+  const duration = Math.max(0, ...sessions.map((s) => s.duration || 0));
   for (const s of sessions) {
     const prev = maxByDate.get(s.date) ?? 0;
     if (s.currentTime > prev) maxByDate.set(s.date, s.currentTime);
@@ -98,7 +102,8 @@ export function reduceSessionsToDailyProgress(
     const cumulativeMinutes = Math.floor(cumulativeSeconds / 60);
     const minutesThatDay = cumulativeMinutes - prevCumulativeMinutes;
     if (minutesThatDay <= 0) continue; // no forward progress this day
-    result.push({ date, cumulativeSeconds, cumulativeMinutes, minutesThatDay });
+    const percent = duration > 0 ? Math.min(100, Math.round((cumulativeSeconds / duration) * 100)) : null;
+    result.push({ date, cumulativeSeconds, cumulativeMinutes, minutesThatDay, percent });
     prevCumulativeMinutes = cumulativeMinutes;
     prevCumulativeSeconds = cumulativeSeconds;
   }
@@ -173,6 +178,11 @@ export function createAbsClient(baseUrl: string, apiToken: string): AbsClient {
 
       // The endpoint is user-global; keep only this book's sessions.
       return all.filter((s) => s.libraryItemId === libraryItemId);
+    },
+
+    async isItemFinished(libraryItemId: string): Promise<boolean> {
+      const meRes = await apiFetch<{ mediaProgress: AbsMediaProgress[] }>('/api/me');
+      return meRes.mediaProgress.some((mp) => mp.libraryItemId === libraryItemId && mp.isFinished);
     },
   };
 }

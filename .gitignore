@@ -7,3 +7,4 @@ data/
 .claude/
 docs/superpowers/
 CLAUDE.md
+.env.bak*

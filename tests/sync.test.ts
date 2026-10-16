@@ -1,13 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { determineSyncActions, diffDailyProgress, reconcileBook, type SyncAction } from '../src/sync.js';
+import { determineSyncActions, diffDailyProgress, reconcileBook, runSync, type SyncAction } from '../src/sync.js';
 import { createDb, type Database } from '../src/db.js';
-import type { AbsDayProgress } from '../src/abs-client.js';
+import type { AbsClient, AbsDayProgress, AbsListeningSession } from '../src/abs-client.js';
 import type { StoryGraph, StoryGraphJournalEntry } from '../src/storygraph.js';
 import fs from 'fs';
 import path from 'path';
 
-function day(date: string, cumulativeMinutes: number): AbsDayProgress {
-  return { date, cumulativeSeconds: cumulativeMinutes * 60, cumulativeMinutes, minutesThatDay: 0 };
+function day(date: string, cumulativeMinutes: number, minutesThatDay = 0, percent: number | null = null): AbsDayProgress {
+  return { date, cumulativeSeconds: cumulativeMinutes * 60, cumulativeMinutes, minutesThatDay, percent };
 }
 const NOW = new Date('2026-05-31T12:00:00Z');
 
@@ -66,6 +66,18 @@ describe('determineSyncActions', () => {
       null
     );
     expect(actions).toEqual([{ type: 'new_book', percent: 5 }]);
+  });
+});
+
+describe('diffDailyProgress — same-day placeholder', () => {
+  it('uses the entry with minutes when a "Started reading" placeholder shares its date', () => {
+    const diff = diffDailyProgress(
+      [day('2026-05-28', 30)],
+      [{ date: '2026-05-28', minutes: 12 }, { date: '2026-05-28', minutes: null }],
+      [],
+      NOW
+    );
+    expect(diff.mismatches).toEqual([{ date: '2026-05-28', absMinutes: 30, sgMinutes: 12 }]);
   });
 });
 
@@ -157,11 +169,12 @@ describe('diffDailyProgress', () => {
 
 // A controllable fake StoryGraph that records calls and serves a scripted journal.
 function fakeStoryGraph(journal: StoryGraphJournalEntry[] = []) {
-  const calls: any = { markAsReading: [], addBackdatedProgress: [], deleteJournalEntry: [], markAsRead: [], recalculateStreak: 0 };
+  const calls: any = { markAsReading: [], addBackdatedProgress: [], deleteJournalEntry: [], markAsRead: [], recalculateStreak: 0, setStartDate: [] };
   const sg: Partial<StoryGraph> = {
     async markAsReading(url) { calls.markAsReading.push(url); },
+    async setStartDate(url, date) { calls.setStartDate.push(date); },
     async getJournalEntries() { return journal; },
-    async addBackdatedProgress(url, date, minutes) { calls.addBackdatedProgress.push({ date, minutes }); },
+    async addBackdatedProgress(url, date, p) { calls.addBackdatedProgress.push({ date, minutes: p.totalMinutes }); calls.progress = [...(calls.progress ?? []), p]; },
     async deleteJournalEntry(id) { calls.deleteJournalEntry.push(id); },
     async markAsRead(url) { calls.markAsRead.push(url); },
     async recalculateStreak() { calls.recalculateStreak++; },
@@ -204,6 +217,26 @@ describe('reconcileBook', () => {
     ]);
   });
 
+  it('passes per-day minutes and percent from ABS along with the cumulative total', async () => {
+    const { sg, calls } = fakeStoryGraph([]);
+    const results = await reconcileBook(sg, db, mapping(), [day('2026-05-28', 30, 30, 4), day('2026-05-29', 124, 94, 17)], false, NOW);
+    expect(results[1]).toMatchObject({ action: 'journal_write', date: '2026-05-29', dayMinutes: 94, totalMinutes: 124, percent: 17 });
+    expect(calls.progress).toEqual([
+      { totalMinutes: 30, dayMinutes: 30, percent: 4 },
+      { totalMinutes: 124, dayMinutes: 94, percent: 17 },
+    ]);
+  });
+
+  it('sets the StoryGraph start date to the first ABS listening day on the first backfill only', async () => {
+    const { sg, calls } = fakeStoryGraph([]);
+    await reconcileBook(sg, db, mapping(), [day('2026-05-28', 30), day('2026-05-29', 60)], false, NOW);
+    expect(calls.setStartDate).toEqual(['2026-05-28']);
+
+    const { sg: sg2, calls: calls2 } = fakeStoryGraph([]);
+    await reconcileBook(sg2, db, mapping(), [day('2026-05-28', 30), day('2026-05-29', 60), day('2026-05-30', 90)], false, NOW);
+    expect(calls2.setStartDate).toEqual([]); // later nightly runs leave the start date alone
+  });
+
   it('is idempotent — a second run writes nothing (local table guards)', async () => {
     const { sg } = fakeStoryGraph([]);
     await reconcileBook(sg, db, mapping(), [day('2026-05-28', 30)], false, NOW);
@@ -229,5 +262,63 @@ describe('reconcileBook', () => {
     const { sg, calls } = fakeStoryGraph([]);
     await reconcileBook(sg, db, mapping(), [day('2026-05-20', 30)], false, NOW);
     expect(calls.recalculateStreak).toBe(1);
+  });
+});
+
+describe('runSync — books that left ABS in-progress', () => {
+  const DIR = path.resolve('./data/test');
+  const DB_PATH = path.join(DIR, 'runsync.db');
+  let db: Database;
+
+  beforeEach(() => {
+    fs.mkdirSync(DIR, { recursive: true });
+    fs.rmSync(DB_PATH, { force: true });
+    db = createDb(DB_PATH);
+    db.upsertBookMapping({
+      absLibraryItemId: 'li_done', storygraphBookUrl: 'https://app.thestorygraph.com/books/done',
+      title: 'Done Book', author: 'A', editionType: 'audio',
+    });
+  });
+  afterEach(() => { db.close(); fs.rmSync(DB_PATH, { force: true }); });
+
+  // Last day: 570 of 600 min yesterday, finished (600) today.
+  const sessions: AbsListeningSession[] = [
+    { id: 's1', libraryItemId: 'li_done', date: '2026-05-29', dayOfWeek: 'Friday', timeListening: 0, startTime: 0, currentTime: 34200, duration: 36000, startedAt: 0, updatedAt: 0 },
+    { id: 's2', libraryItemId: 'li_done', date: '2026-05-30', dayOfWeek: 'Saturday', timeListening: 0, startTime: 34200, currentTime: 36000, duration: 36000, startedAt: 0, updatedAt: 0 },
+  ];
+  const fakeAbs = (finished: boolean): AbsClient => ({
+    async getItemsInProgress() { return []; }, // finished books drop out of in-progress
+    async getListeningSessions() { return sessions; },
+    async isItemFinished() { return finished; },
+  });
+
+  it('writes the remaining days and marks the book finished when ABS says it is finished', async () => {
+    const { sg, calls } = fakeStoryGraph([]);
+    const prompted: string[] = [];
+    await runSync(fakeAbs(true), db, sg, () => {}, (m) => prompted.push(m.title));
+
+    expect(calls.addBackdatedProgress.map((c: any) => c.date)).toEqual(['2026-05-29', '2026-05-30']);
+    expect(calls.markAsRead).toEqual(['https://app.thestorygraph.com/books/done']);
+    expect(prompted).toEqual([]); // no "did you finish it?" prompt needed
+    const mappingId = db.getBookMappingByAbsId('li_done')!.id;
+    expect(db.getLastSync(mappingId)).toMatchObject({ action: 'mark_read', status: 'success' });
+  });
+
+  it('does nothing more on the next run once marked finished', async () => {
+    await runSync(fakeAbs(true), db, fakeStoryGraph([]).sg, () => {}, () => {});
+    const { sg, calls } = fakeStoryGraph([]);
+    await runSync(fakeAbs(true), db, sg, () => {}, () => {});
+    expect(calls.markAsRead).toEqual([]);
+    expect(calls.addBackdatedProgress).toEqual([]);
+  });
+
+  it('still asks via the prompt when the book left without being finished', async () => {
+    const mappingId = db.getBookMappingByAbsId('li_done')!.id;
+    db.logSync({ bookMappingId: mappingId, progressPercent: 90, action: 'reconcile', status: 'success', errorMessage: null });
+    const { sg, calls } = fakeStoryGraph([]);
+    const prompted: string[] = [];
+    await runSync(fakeAbs(false), db, sg, () => {}, (m) => prompted.push(m.title));
+    expect(prompted).toEqual(['Done Book']);
+    expect(calls.markAsRead).toEqual([]);
   });
 });

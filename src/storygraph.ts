@@ -35,6 +35,75 @@ export function matchEditionByIdentifier(
   return editions.find((e) => normalizeIdentifier(e.isbn) === norm) ?? null;
 }
 
+/**
+ * Parse one edition card's text (from the /books/<id>/editions page) into an
+ * edition. `bookHref` is the card's own /books/<id> link. Returns null without one.
+ */
+export function parseEditionCard(cardText: string, bookHref: string | null): StoryGraphEdition | null {
+  if (!bookHref) return null;
+  const lines = cardText.split('\n').map((l) => l.replace(/\s+/g, ' ').trim()).filter(Boolean);
+  const infoIdx = lines.findIndex((l) => /•\s*\w+\s*•\s*\d{4}/.test(l)); // "12h 30m • audio • 2026"
+  const field = (label: string) =>
+    lines.find((l) => l.startsWith(`${label}:`))?.slice(label.length + 1).trim() || null;
+
+  // Title is the first line after the optional "You're currently reading another edition" banner.
+  const title = lines.find((l) => !/currently reading another edition|^current edition$/i.test(l)) ?? 'Unknown';
+  const isbnRaw = field('ISBN/UID');
+  const language = field('Language');
+  const publisher = field('Publisher');
+  const info = [
+    infoIdx >= 0 ? lines[infoIdx] : '',
+    language ? `Language: ${language}` : '',
+    publisher ? `Publisher: ${publisher}` : '',
+  ].filter(Boolean).join('\n');
+
+  return {
+    title,
+    format: (field('Format') ?? 'unknown').toLowerCase(),
+    info,
+    bookUrl: bookHref.startsWith('/') ? `https://app.thestorygraph.com${bookHref}` : bookHref,
+    coverUrl: '',
+    isbn: isbnRaw && isbnRaw.toLowerCase() !== 'none' ? isbnRaw : null,
+  };
+}
+
+/**
+ * Pick the audio edition to track an audiobook against. Journal minutes are only
+ * kept on audio editions — a print edition records "0 pages" instead. Prefers the
+ * audio edition matching ABS's ASIN/ISBN, then the chosen URL if it is already
+ * audio, then the only audio edition. Otherwise keeps the chosen URL.
+ */
+export function chooseAudioEdition(
+  editions: StoryGraphEdition[],
+  chosenUrl: string,
+  ids: { asin: string | null | undefined; isbn: string | null | undefined }
+): string {
+  const audio = editions.filter((e) => e.format === 'audio' || e.format === 'audiobook');
+  const byId = matchEditionByIdentifier(audio, ids.asin) ?? matchEditionByIdentifier(audio, ids.isbn);
+  if (byId) return byId.bookUrl;
+  if (audio.some((e) => e.bookUrl === chosenUrl)) return chosenUrl;
+  const uniqueAudio = new Set(audio.map((e) => e.bookUrl));
+  if (uniqueAudio.size === 1) return audio[0].bookUrl;
+  return chosenUrl;
+}
+
+/** The id of an entry on `date` that exists in `after` but not in `before`, or null. */
+export function pickNewEntry(
+  before: StoryGraphJournalEntry[],
+  after: StoryGraphJournalEntry[],
+  date: string
+): string | null {
+  const old = new Set(before.map((e) => e.entryId));
+  return after.find((e) => e.date === date && e.entryId && !old.has(e.entryId))?.entryId ?? null;
+}
+
+/** What to record on one dated audiobook journal entry. */
+export interface JournalProgress {
+  totalMinutes: number; // cumulative minutes listened by end of day
+  dayMinutes: number; // minutes listened that day
+  percent: number | null; // % of the book reached (StoryGraph won't compute it for edited entries)
+}
+
 /** A reading-progress entry read from a StoryGraph journal page. */
 export interface StoryGraphJournalEntry {
   entryId: string | null; // the /journal_entries/<id> UUID, if an Edit link was present
@@ -95,6 +164,9 @@ export function parseJournalEntryRow(
   const month = String(MONTHS.indexOf(dateMatch[2].toLowerCase()) + 1).padStart(2, '0');
   const date = `${dateMatch[3]}-${month}-${day}`;
 
+  // "(02:04 out of 12:30)" is the cumulative total; "N minutes listened" is that day's
+  // minutes (equal to the total only on entries written before per-day minutes were sent).
+  const totalMatch = rowText.match(/\((\d+):(\d{2})\s+out of/i);
   const minutesMatch = rowText.match(/(\d+)\s+minutes?\s+listened/i);
   const percentMatch = rowText.match(/(\d+)\s*%/);
   const entryId = editHref?.match(/\/journal_entries\/([0-9a-f-]+)/i)?.[1] ?? null;
@@ -102,7 +174,11 @@ export function parseJournalEntryRow(
   return {
     entryId,
     date,
-    minutes: minutesMatch ? parseInt(minutesMatch[1], 10) : null,
+    minutes: totalMatch
+      ? parseInt(totalMatch[1], 10) * 60 + parseInt(totalMatch[2], 10)
+      : minutesMatch
+        ? parseInt(minutesMatch[1], 10)
+        : null,
     percent: percentMatch ? parseInt(percentMatch[1], 10) : null,
   };
 }
@@ -120,12 +196,19 @@ export interface StoryGraph {
   getEditions(bookUrl: string): Promise<StoryGraphEdition[]>;
   /** Find the edition of `bookUrl` whose ISBN/ASIN matches `identifier`, or null. */
   findEditionByIdentifier(bookUrl: string, identifier: string): Promise<StoryGraphEdition | null>;
+  /**
+   * If the user's shelf holds a different edition of this book, switch it to
+   * `editionUrl` (journal entries follow the shelved edition). No-op otherwise.
+   */
+  switchToEdition(editionUrl: string): Promise<void>;
   /** Read the dated progress (journal) entries currently on StoryGraph for a book. */
   getJournalEntries(bookUrl: string): Promise<StoryGraphJournalEntry[]>;
-  /** Create a backdated journal entry (cumulative minutes) for a past date. */
-  addBackdatedProgress(bookUrl: string, date: string, minutes: number): Promise<void>;
-  /** Set the cumulative minutes (and date) on an existing journal entry via the edit endpoint. */
-  setEntryMinutes(entryId: string, date: string, minutes: number): Promise<void>;
+  /** Create a backdated audiobook journal entry for a past date. */
+  addBackdatedProgress(bookUrl: string, date: string, progress: JournalProgress): Promise<void>;
+  /** Set day/total minutes, percent and date on an existing journal entry via the edit endpoint. */
+  setEntryMinutes(entryId: string, date: string, progress: JournalProgress): Promise<void>;
+  /** Move the "Started reading" date of the current read to `date` ('YYYY-MM-DD'). */
+  setStartDate(bookUrl: string, date: string): Promise<void>;
   /** Delete a journal entry by id (used to repair a mismatched day before recreating it). */
   deleteJournalEntry(entryId: string): Promise<void>;
   /** Trigger StoryGraph's "Recalculate Streak" after backdated writes (best-effort). */
@@ -393,29 +476,12 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
 
     async getEditions(bookUrl: string): Promise<StoryGraphEdition[]> {
       return withRetry('getEditions', async () => {
-        // Navigate to the book page first
-        logger.info(`StoryGraph getEditions: navigating to ${bookUrl}`);
-        await page.goto(bookUrl, { waitUntil: 'networkidle2', timeout: 15000 });
-        await handleTurnstile(bookUrl);
-
-        // Find and click the "X editions" link
-        const editionsLink = await page.$('a[href*="editions"]');
-        if (editionsLink) {
-          logger.info('StoryGraph getEditions: found editions link, clicking...');
-          await editionsLink.click();
-          await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => null);
-          await sleep(2000);
-          await handleTurnstile(page.url());
-        } else {
-          // Try navigating directly to editions URL
-          const editionsUrl = bookUrl.replace(/\/?$/, '/editions');
-          logger.info(`StoryGraph getEditions: no editions link found, trying ${editionsUrl}`);
-          await page.goto(editionsUrl, { waitUntil: 'networkidle2', timeout: 15000 });
-          await handleTurnstile(editionsUrl);
-        }
-
-        logger.info(`StoryGraph getEditions: on page ${page.url()}`);
-        await page.screenshot({ path: path.join(screenshotsDir, 'debug-editions-latest.png'), fullPage: true });
+        const bookId = bookIdFromUrl(bookUrl);
+        if (!bookId) throw new Error(`Cannot extract book id from ${bookUrl}`);
+        const editionsUrl = `https://app.thestorygraph.com/books/${bookId}/editions`;
+        logger.info(`StoryGraph getEditions: ${editionsUrl}`);
+        await page.goto(editionsUrl, { waitUntil: 'networkidle2', timeout: 15000 });
+        await handleTurnstile(editionsUrl);
 
         // Scroll to load all editions
         for (let i = 0; i < 3; i++) {
@@ -423,99 +489,27 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
           await sleep(1000);
         }
 
-        // Parse editions — the editions page has rich cards with "Format:", "ISBN/UID:", etc.
-        const editions = await page.evaluate(() => {
-          const results: Array<{title: string; format: string; info: string; bookUrl: string; coverUrl: string; isbn: string | null}> = [];
-
-          // Each edition card contains: cover img, title, author, "Xpages • format • year",
-          // and labeled fields like "Format: Audio", "ISBN/UID: ...", "Publisher: ..."
-          // Look for "switch to this edition" buttons to identify edition cards
-          const switchButtons = document.querySelectorAll('button, a');
-          const editionCards = new Set<Element>();
-
-          // Find all cards that contain edition info by looking for "Format:" text
-          const allElements = document.querySelectorAll('*');
-          for (const el of allElements) {
-            const text = el.textContent || '';
-            if (text.includes('Format:') && text.includes('Language:') && el.querySelector('img')) {
-              editionCards.add(el);
-            }
-          }
-
-          // If we found edition cards, parse them
-          if (editionCards.size > 0) {
-            for (const card of editionCards) {
-              const cardText = card.textContent || '';
-
-              // Extract Format
-              const formatMatch = cardText.match(/Format:\s*([\w\s]+?)(?:\n|$|ISBN)/);
-              const format = formatMatch ? formatMatch[1].trim().toLowerCase() : 'unknown';
-
-              // Extract title from bold/heading element
-              const titleEl = card.querySelector('h3, h2, .font-bold, [class*="title"]');
-              const title = titleEl?.textContent?.trim() || 'Unknown';
-
-              // Extract info line (e.g., "8h 58m • audio • 2017" or "305 pages • hardcover • 2017")
-              const infoMatch = cardText.match(/(\d+h?\s*\d*m?|\d+\s*pages)\s*•\s*\w+\s*•\s*\d{4}/);
-              const info = infoMatch ? infoMatch[0] : '';
-
-              // Extract book URL from any link in the card
-              const linkEl = card.querySelector('a[href*="/books/"]');
-              const bookUrl = linkEl?.getAttribute('href') || '';
-
-              // Cover image
-              const imgEl = card.querySelector('img');
-              const coverUrl = imgEl?.getAttribute('src') || '';
-
-              // Extract publisher
-              const pubMatch = cardText.match(/Publisher:\s*(.+?)(?:\n|$)/);
-              const publisher = pubMatch ? pubMatch[1].trim() : '';
-
-              // Extract ISBN/UID (may be an ISBN-13/10 or an Amazon ASIN)
-              const isbnMatch = cardText.match(/ISBN\/UID:\s*([\w-]+)/);
-              const isbn = isbnMatch ? isbnMatch[1].trim() : null;
-
-              const fullInfo = [info, publisher ? `Publisher: ${publisher}` : ''].filter(Boolean).join('\n');
-
-              results.push({ title, format, info: fullInfo, bookUrl, coverUrl, isbn });
-            }
-          }
-
-          // Fallback: try the simpler .book-title-author-and-series selector
-          if (results.length === 0) {
-            const bookElements = document.querySelectorAll('.book-title-author-and-series');
-            for (const el of bookElements) {
-              const linkEl = el.querySelector('a');
-              const title = linkEl?.textContent?.trim() || '';
-              const bookUrl = linkEl?.getAttribute('href') || '';
-              const fullText = el.textContent || '';
-              const lines = fullText.split('\n').map(l => l.trim()).filter(Boolean);
-              const info = lines.length > 1 ? lines.slice(1).join(' • ') : '';
-              const lowerInfo = info.toLowerCase();
-              let format = 'unknown';
-              if (lowerInfo.includes('audio')) format = 'audio';
-              else if (lowerInfo.includes('digital') || lowerInfo.includes('ebook') || lowerInfo.includes('kindle')) format = 'digital';
-              else if (lowerInfo.includes('paperback')) format = 'paperback';
-              else if (lowerInfo.includes('hardcover')) format = 'hardcover';
-
-              const card = el.parentElement?.parentElement;
-              const imgEl = card?.querySelector('img');
-              const coverUrl = imgEl?.getAttribute('src') || '';
-              const isbnMatch = fullText.match(/ISBN\/UID:\s*([\w-]+)/);
-              const isbn = isbnMatch ? isbnMatch[1].trim() : null;
-              results.push({ title, format, info, bookUrl, coverUrl, isbn });
-            }
-          }
-
-          return results;
+        // An edition card is the LARGEST element holding exactly one "ISBN/UID:" line —
+        // smaller elements miss fields, and page wrappers span every card.
+        const cards = await page.evaluate(() => {
+          const isCard = (el: Element) => ((el.textContent || '').match(/ISBN\/UID:/g) || []).length === 1;
+          return Array.from(document.querySelectorAll('body *'))
+            .filter((el) => isCard(el) && !(el.parentElement && isCard(el.parentElement)))
+            .map((el) => ({
+              text: (el as HTMLElement).innerText || el.textContent || '',
+              href: el.querySelector('a[href^="/books/"]')?.getAttribute('href') ?? null,
+              coverUrl: el.querySelector('img')?.getAttribute('src') ?? '',
+            }));
         });
 
-        return editions.map((e) => ({
-          ...e,
-          bookUrl: e.bookUrl.startsWith('/')
-            ? `https://app.thestorygraph.com${e.bookUrl}`
-            : e.bookUrl,
-        }));
+        // StoryGraph renders each card twice (mobile + desktop layouts) — dedupe by URL.
+        const byUrl = new Map<string, StoryGraphEdition>();
+        for (const c of cards) {
+          const e = parseEditionCard(c.text, c.href);
+          if (e && !byUrl.has(e.bookUrl)) byUrl.set(e.bookUrl, { ...e, coverUrl: c.coverUrl });
+        }
+        logger.info(`StoryGraph getEditions: parsed ${byUrl.size} editions`);
+        return [...byUrl.values()];
       });
     },
 
@@ -1040,6 +1034,32 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
       return matchEditionByIdentifier(editions, identifier);
     },
 
+    async switchToEdition(editionUrl: string): Promise<void> {
+      return withRetry('switchToEdition', async () => {
+        const toId = bookIdFromUrl(editionUrl);
+        if (!toId) throw new Error(`Cannot extract book id from ${editionUrl}`);
+        const editionsUrl = `https://app.thestorygraph.com/books/${toId}/editions`;
+        await page.goto(editionsUrl, { waitUntil: 'networkidle2', timeout: 15000 });
+        await handleTurnstile(editionsUrl);
+        // A "switch to this edition" form only exists when another edition is shelved.
+        const fromId = await page.evaluate((id: string) => {
+          const input = document.querySelector(
+            `form[action="/switch-editions"] input[name="to_book_id"][value="${id}"]`
+          ) as HTMLInputElement | null;
+          if (!input?.form) return null;
+          const from = (input.form.querySelector('input[name="from_book_id"]') as HTMLInputElement | null)?.value ?? null;
+          input.form.requestSubmit();
+          return from;
+        }, toId);
+        if (!fromId) {
+          logger.info(`switchToEdition(${toId}): no other edition shelved, nothing to switch`);
+          return;
+        }
+        await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => null);
+        logger.info(`switchToEdition: switched ${fromId} -> ${toId}`);
+      });
+    },
+
     async getJournalEntries(bookUrl: string): Promise<StoryGraphJournalEntry[]> {
       return withRetry('getJournalEntries', async () => {
         const bookId = bookIdFromUrl(bookUrl);
@@ -1054,24 +1074,19 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
           await sleep(1000);
         }
 
-        // Anchor on each entry's "Edit" link, then walk up to the smallest ancestor
-        // that carries the date — that isolates one entry's row text.
+        // Anchor on each entry's "Edit" link, then walk up to the LARGEST ancestor
+        // that still holds only this one Edit link. The smallest dated ancestor is
+        // just the "4 October 2026 Edit" header and misses the minutes line below it.
         const rows = await page.evaluate(() => {
           const out: Array<{ rowText: string; editHref: string | null }> = [];
-          const links = document.querySelectorAll('a[href*="/journal_entries/"][href*="/edit"]');
-          for (const link of links) {
+          const sel = 'a[href*="/journal_entries/"][href*="/edit"]';
+          for (const link of document.querySelectorAll(sel)) {
             const editHref = link.getAttribute('href');
-            let el: Element | null = link.parentElement;
-            let rowText = '';
-            for (let depth = 0; depth < 6 && el; depth++) {
-              const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
-              if (/\b(19|20)\d{2}\b/.test(t) && t.length < 600) {
-                rowText = t;
-                break;
-              }
+            let el: Element = link;
+            while (el.parentElement && el.parentElement.querySelectorAll(sel).length === 1) {
               el = el.parentElement;
             }
-            out.push({ rowText, editHref });
+            out.push({ rowText: (el.textContent || '').replace(/\s+/g, ' ').trim(), editHref });
           }
           return out;
         });
@@ -1152,7 +1167,7 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
       }
     },
 
-    async addBackdatedProgress(bookUrl: string, date: string, minutes: number): Promise<void> {
+    async addBackdatedProgress(bookUrl: string, date: string, progress: JournalProgress): Promise<void> {
       return withRetry('addBackdatedProgress', async () => {
         // StoryGraph's "Add note/Edit date" form is JS-driven and the minutes field
         // is unreliable to drive headlessly (HH:MM, overlay-covered, order-sensitive,
@@ -1165,6 +1180,10 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
         const formUrl = `https://app.thestorygraph.com/progress-update?book_id=${bookId}&return_to=${encodeURIComponent(bookUrl)}`;
         const [year, month, day] = date.split('-').map((n) => String(parseInt(n, 10)));
         const F = 'form[action="/update-progress-with-note"]';
+
+        // Snapshot existing entries so Step 2 sets minutes on the NEW entry, not an
+        // older one on the same date (e.g. the auto "Started reading" placeholder).
+        const before = await api.getJournalEntries(bookUrl);
 
         // --- Step 1: create a dated entry (date selects are reliable) ---
         await page.goto(formUrl, { waitUntil: 'networkidle2', timeout: 20000 });
@@ -1187,23 +1206,79 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
 
         // --- Step 2: find the just-created entry for this date and set its minutes ---
         const entries = await api.getJournalEntries(bookUrl);
-        const target = entries.find((e) => e.date === date && e.entryId);
-        if (!target?.entryId) {
+        const entryId = pickNewEntry(before, entries, date);
+        if (!entryId) {
           throw new Error(`addBackdatedProgress: created entry for ${date} not found to set minutes`);
         }
-        await api.setEntryMinutes(target.entryId, date, minutes);
-        logger.info(`addBackdatedProgress(${date}, ${minutes}m): entry ${target.entryId}`);
+        await api.setEntryMinutes(entryId, date, progress);
+        logger.info(`addBackdatedProgress(${date}, ${progress.totalMinutes}m): entry ${entryId}`);
       });
     },
 
-    async setEntryMinutes(entryId: string, date: string, minutes: number): Promise<void> {
+    async setStartDate(bookUrl: string, date: string): Promise<void> {
+      return withRetry('setStartDate', async () => {
+        // The "Started <date>" pencil on the book page links to the read's
+        // "Started reading" journal entry; its date IS the start date.
+        await page.goto(bookUrl, { waitUntil: 'networkidle2', timeout: 15000 });
+        await handleTurnstile(bookUrl);
+        const entryId = await page.evaluate(() => {
+          const link = Array.from(document.querySelectorAll('a[href*="/edit-journal-entry-from-book"]')).find((a) =>
+            /Started\s/.test(a.textContent || '')
+          );
+          return link?.getAttribute('href')?.match(/journal_entry_id=([0-9a-f-]+)/i)?.[1] ?? null;
+        });
+        if (!entryId) throw new Error('setStartDate: no "Started" date link on the book page');
+
+        const editUrl = `https://app.thestorygraph.com/journal_entries/${entryId}/edit`;
+        await page.goto(editUrl, { waitUntil: 'networkidle2', timeout: 20000 });
+        await handleTurnstile(editUrl);
+        const [year, month, day] = date.split('-').map((n) => String(parseInt(n, 10)));
+        const result = await page.evaluate(
+          async (id: string, d: string, m: string, y: string) => {
+            const token = document.querySelector('meta[name="csrf-token"]')?.getAttribute('content');
+            if (!token) return { ok: false, error: 'no CSRF token' };
+            const body = new URLSearchParams({
+              _method: 'put',
+              authenticity_token: token,
+              'journal_entry[day]': d,
+              'journal_entry[month]': m,
+              'journal_entry[year]': y,
+            });
+            const res = await fetch(`/journal_entries/${id}`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'X-CSRF-Token': token,
+                'X-Requested-With': 'XMLHttpRequest',
+              },
+              body: body.toString(),
+              credentials: 'include',
+            });
+            return { ok: res.ok, status: res.status };
+          },
+          entryId,
+          day,
+          month,
+          year
+        );
+        logger.info(`setStartDate(${date}) via entry ${entryId}: ${JSON.stringify(result)}`);
+        if (!result.ok) throw new Error(`setStartDate failed: ${JSON.stringify(result)}`);
+      });
+    },
+
+    async setEntryMinutes(entryId: string, date: string, progress: JournalProgress): Promise<void> {
       return withRetry('setEntryMinutes', async () => {
         const url = `https://app.thestorygraph.com/journal_entries/${entryId}/edit`;
         await page.goto(url, { waitUntil: 'networkidle2', timeout: 20000 });
         await handleTurnstile(url);
         const [year, month, day] = date.split('-').map((n) => String(parseInt(n, 10)));
         const result = await page.evaluate(
-          async (id: string, d: string, m: string, y: string, mins: number) => {
+          async (id: string, d: string, m: string, y: string, prog: { totalMinutes: number; dayMinutes: number; percent: number | null }) => {
+            // A print-edition entry has no minutes fields and StoryGraph silently drops
+            // the value (still 200) — fail loudly instead.
+            if (!document.querySelector('input[name="journal_entry[minutes_listened_total]"]')) {
+              return { ok: false, error: 'entry has no minutes field (shelved edition is not audio)' };
+            }
             const token =
               document.querySelector('meta[name="csrf-token"]')?.getAttribute('content') ||
               (document.querySelector('input[name="authenticity_token"]') as HTMLInputElement | null)?.value;
@@ -1214,10 +1289,13 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
               'journal_entry[day]': d,
               'journal_entry[month]': m,
               'journal_entry[year]': y,
-              // The edit endpoint takes a plain minute count (unlike the create form's HH:MM).
-              'journal_entry[minutes_listened_total]': String(mins),
-              'journal_entry[minutes_listened]': String(mins),
+              // The edit endpoint takes plain minute counts (unlike the create form's HH:MM):
+              // minutes_listened is that day's listening, _total the running total.
+              'journal_entry[minutes_listened_total]': String(prog.totalMinutes),
+              'journal_entry[minutes_listened]': String(prog.dayMinutes),
             });
+            // StoryGraph doesn't derive the percent for edited entries (shows 0%).
+            if (prog.percent != null) body.set('journal_entry[percent_reached]', String(prog.percent));
             try {
               const res = await fetch(`/journal_entries/${id}`, {
                 method: 'POST',
@@ -1239,9 +1317,11 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
           day,
           month,
           year,
-          minutes
+          progress
         );
-        logger.info(`setEntryMinutes(${entryId} -> ${date}, ${minutes}m): ${JSON.stringify(result)}`);
+        logger.info(
+          `setEntryMinutes(${entryId} -> ${date}, ${progress.dayMinutes}m day / ${progress.totalMinutes}m total / ${progress.percent}%): ${JSON.stringify(result)}`
+        );
         if (!result.ok) throw new Error(`setEntryMinutes failed: ${JSON.stringify(result)}`);
       });
     },

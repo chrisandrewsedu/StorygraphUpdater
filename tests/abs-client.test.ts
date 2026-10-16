@@ -214,6 +214,19 @@ describe('reduceSessionsToDailyProgress', () => {
     expect(daily.map((d) => d.minutesThatDay)).toEqual([30, 30]);
   });
 
+  it('computes percent of the book reached from the session duration', () => {
+    const daily = reduceSessionsToDailyProgress([
+      session('2026-05-01', 1800), // 30 of 600 min = 5%
+      session('2026-05-02', 34200), // 570 of 600 min = 95%
+    ]);
+    expect(daily.map((d) => d.percent)).toEqual([5, 95]);
+  });
+
+  it('leaves percent null when ABS reports no duration', () => {
+    const daily = reduceSessionsToDailyProgress([{ ...session('2026-05-01', 1800), duration: 0 }]);
+    expect(daily[0].percent).toBeNull();
+  });
+
   it('clamps a backwards currentTime regression to the prior cumulative', () => {
     const daily = reduceSessionsToDailyProgress([
       session('2026-05-01', 3600), // 60 min
