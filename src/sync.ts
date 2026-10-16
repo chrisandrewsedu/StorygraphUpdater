@@ -2,7 +2,7 @@ import { logger } from './logger.js';
 import { reduceSessionsToDailyProgress } from './abs-client.js';
 import type { AbsBookProgress, AbsClient, AbsDayProgress } from './abs-client.js';
 import type { Database, BookMapping } from './db.js';
-import { chooseAudioEdition, type StoryGraph } from './storygraph.js';
+import { bookIdFromUrl, chooseAudioEdition, type StoryGraph } from './storygraph.js';
 
 /** Minutes tolerance before an ABS↔StoryGraph day is treated as a mismatch (absorbs rounding). */
 const MISMATCH_TOLERANCE_MIN = 1;
@@ -145,18 +145,30 @@ export async function reconcileBook(
   now: Date
 ): Promise<SyncResult[]> {
   const results: SyncResult[] = [];
-  const url = mapping.storygraphBookUrl;
-
-  const existing = (await storygraph.getJournalEntries(url)).filter(Boolean);
-  const existingByDate = new Map<string, (typeof existing)[number]>();
-  for (const e of existing) {
-    if (e.minutes != null || !existingByDate.has(e.date)) existingByDate.set(e.date, e);
-  }
+  let url = mapping.storygraphBookUrl;
   const localWritten = db
     .getJournalEntries(mapping.id)
     .filter((e) => e.status === 'success')
     .map((e) => ({ date: e.entryDate, minutes: e.minutes }));
 
+  let existing = (await storygraph.getJournalEntries(url)).filter(Boolean);
+
+  // We've written days before but the journal now reads empty: the user most likely
+  // switched editions on StoryGraph (entries follow the shelved edition). Follow it.
+  if (existing.length === 0 && localWritten.length > 0) {
+    const switched = await followShelvedEdition(storygraph, db, mapping);
+    if (switched) {
+      results.push(switched.result);
+      if (!switched.result.success) return results; // print edition: writing would record 0 pages
+      url = switched.url;
+      existing = (await storygraph.getJournalEntries(url)).filter(Boolean);
+    }
+  }
+
+  const existingByDate = new Map<string, (typeof existing)[number]>();
+  for (const e of existing) {
+    if (e.minutes != null || !existingByDate.has(e.date)) existingByDate.set(e.date, e);
+  }
   const diff = diffDailyProgress(
     daily,
     existing.map((e) => ({ date: e.date, minutes: e.minutes })),
@@ -240,6 +252,91 @@ export async function reconcileBook(
 }
 
 /**
+ * If the user's shelf now holds a different edition than the mapping, point the
+ * mapping at it — but only if it is an audio edition (print editions drop minutes).
+ * Returns null when nothing changed.
+ */
+async function followShelvedEdition(
+  storygraph: StoryGraph,
+  db: Database,
+  mapping: BookMapping
+): Promise<{ url: string; result: SyncResult } | null> {
+  const shelvedId = await storygraph.findShelvedEdition(mapping.storygraphBookUrl).catch(() => null);
+  if (!shelvedId || shelvedId === bookIdFromUrl(mapping.storygraphBookUrl)) return null;
+  const newUrl = `https://app.thestorygraph.com/books/${shelvedId}`;
+  const format = (await storygraph.getEditionFormat(newUrl).catch(() => null)) ?? 'unknown';
+  if (format !== 'audio' && format !== 'audiobook') {
+    logger.warn(`${mapping.title}: shelf moved to a ${format} edition (${newUrl}); not syncing`);
+    return {
+      url: newUrl,
+      result: {
+        book: mapping.title,
+        action: 'edition_changed',
+        success: false,
+        error: `StoryGraph shelf switched to a ${format} edition, which can't record listening minutes. Switch it back to an audio edition, or /link again.`,
+      },
+    };
+  }
+  db.upsertBookMapping({ ...mapping, storygraphBookUrl: newUrl });
+  logger.info(`${mapping.title}: following shelf to audio edition ${newUrl}`);
+  return { url: newUrl, result: { book: mapping.title, action: 'edition_changed', success: true } };
+}
+
+/**
+ * Make sure the StoryGraph session is live, logging in again with the saved
+ * credentials if it expired. `relogged` is true when a fresh login happened.
+ */
+export async function ensureLoggedIn(
+  storygraph: StoryGraph,
+  creds: { email: string; password: string }
+): Promise<{ ok: boolean; relogged: boolean }> {
+  if (await storygraph.isLoggedIn()) return { ok: true, relogged: false };
+  if (!creds.email || !creds.password) return { ok: false, relogged: false };
+  const ok = await storygraph.login(creds.email, creds.password).catch(() => false);
+  return { ok, relogged: ok };
+}
+
+/**
+ * Read-only check that StoryGraph's pages still parse, using the most recently
+ * synced book: search, editions and journal (with minutes). StoryGraph has no API,
+ * so a site change otherwise breaks syncing silently. Returns what failed.
+ */
+export async function runSmokeCheck(
+  storygraph: StoryGraph,
+  db: Database
+): Promise<{ checked: string | null; problems: string[] }> {
+  const mapping = [...db.getAllBookMappings()]
+    .sort((a, b) => b.id - a.id)
+    .find((m) => db.getJournalEntries(m.id).some((e) => e.status === 'success'));
+  if (!mapping) return { checked: null, problems: [] };
+
+  const problems: string[] = [];
+  const check = async (what: string, fn: () => Promise<string | null>) => {
+    try {
+      const problem = await fn();
+      if (problem) problems.push(problem);
+    } catch (err) {
+      problems.push(`${what} failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  };
+  await check('search', async () =>
+    (await storygraph.searchBooks(mapping.title)).length ? null : `search for "${mapping.title}" found nothing`
+  );
+  await check('editions', async () => {
+    const editions = await storygraph.getEditions(mapping.storygraphBookUrl);
+    return editions.some((e) => e.format === 'audio' || e.format === 'audiobook')
+      ? null
+      : `editions page parsed ${editions.length} editions and no audio edition`;
+  });
+  await check('journal', async () => {
+    const entries = await storygraph.getJournalEntries(mapping.storygraphBookUrl);
+    if (!entries.length) return 'journal page parsed no entries';
+    return entries.some((e) => e.minutes != null) ? null : 'journal entries parsed without minutes';
+  });
+  return { checked: mapping.title, problems };
+}
+
+/**
  * Link an ABS book to StoryGraph. Journal minutes only stick on an AUDIO edition
  * (a print edition records "0 pages"), and entries follow whichever edition is
  * shelved — so resolve to the matching audio edition, switch the shelf to it,
@@ -253,8 +350,17 @@ export async function linkBook(
   storygraphBookUrl: string
 ): Promise<BookMapping> {
   try {
-    const editions = await storygraph.getEditions(storygraphBookUrl);
-    const audioUrl = chooseAudioEdition(editions, storygraphBookUrl, { asin: absBook?.asin, isbn: absBook?.isbn });
+    // Exact match by ASIN/ISBN via StoryGraph's edition search; else scan the editions list.
+    let audioUrl: string | null = null;
+    for (const id of [absBook?.asin, absBook?.isbn]) {
+      if (!id || audioUrl) continue;
+      const match = await storygraph.findEditionByIdentifier(storygraphBookUrl, id).catch(() => null);
+      if (match && (match.format === 'audio' || match.format === 'audiobook')) audioUrl = match.bookUrl;
+    }
+    if (!audioUrl) {
+      const editions = await storygraph.getEditions(storygraphBookUrl);
+      audioUrl = chooseAudioEdition(editions, storygraphBookUrl, { asin: absBook?.asin, isbn: absBook?.isbn });
+    }
     if (audioUrl !== storygraphBookUrl) {
       logger.info(`linkBook: using audio edition ${audioUrl} instead of ${storygraphBookUrl}`);
       storygraphBookUrl = audioUrl;
@@ -302,7 +408,9 @@ export async function runSync(
   db: Database,
   storygraph: StoryGraph,
   onNewBook: (book: AbsBookProgress) => void,
-  onBookFinished: (mapping: { mappingId: number; title: string; storygraphBookUrl: string }) => void
+  onBookFinished: (mapping: { mappingId: number; title: string; storygraphBookUrl: string }) => void,
+  /** Called after a book finished in ABS was marked finished automatically (e.g. to ask for a rating). */
+  onAutoFinished?: (mapping: { mappingId: number; title: string; storygraphBookUrl: string }) => void
 ): Promise<SyncResult[]> {
   logger.info('Starting sync...');
   const results: SyncResult[] = [];
@@ -387,6 +495,10 @@ export async function runSync(
           errorMessage: marked ? null : bookResults.find((r) => !r.success)?.error ?? 'mark_read failed',
         });
         logger.info(`${mapping.title} finished in ABS — ${marked ? 'marked finished on StoryGraph' : 'mark finished FAILED'}`);
+        if (marked) {
+          const current = db.getBookMappingByAbsId(mapping.absLibraryItemId) ?? mapping;
+          onAutoFinished?.({ mappingId: current.id, title: current.title, storygraphBookUrl: current.storygraphBookUrl });
+        }
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);
         db.logSync({ bookMappingId: mapping.id, progressPercent: 100, action: 'mark_read', status: 'failed', errorMessage: errorMsg });

@@ -9,6 +9,7 @@ import {
   parseEditionCard,
   chooseAudioEdition,
   pickNewEntry,
+  parseBookPageFormat,
   type StoryGraphEdition,
   type StoryGraphBook,
 } from '../src/storygraph.js';
@@ -239,5 +240,15 @@ describe('matchShelfByTitle', () => {
   it('returns null when two different books share the title (ambiguous)', () => {
     const shelf = [book('Catching Fire', '/books/a'), book('Catching Fire', '/books/b')];
     expect(matchShelfByTitle(shelf, 'Catching Fire')).toBeNull();
+  });
+});
+
+describe('parseBookPageFormat', () => {
+  it('reads the edition format from the book page text', () => {
+    expect(parseBookPageFormat('ISBN/UID: 9781980035077\n  Format: Audio\n  Language: English')).toBe('audio');
+    expect(parseBookPageFormat('Format: Hardcover Language: English')).toBe('hardcover');
+  });
+  it('returns null when no format is shown', () => {
+    expect(parseBookPageFormat('no edition info')).toBeNull();
   });
 });

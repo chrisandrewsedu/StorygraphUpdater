@@ -3,15 +3,19 @@ import { logger } from './logger.js';
 import type { Database } from './db.js';
 import { matchShelfByTitle, type StoryGraph, type StoryGraphSearchResult, type StoryGraphEdition } from './storygraph.js';
 import type { AbsClient, AbsBookProgress } from './abs-client.js';
-import { runSync, backfillMapping, linkBook, type SyncResult } from './sync.js';
-import { escapeMd, formatBackfillSummary, formatDayLine } from './format.js';
+import { runSync, backfillMapping, linkBook, ensureLoggedIn, runSmokeCheck, type SyncResult } from './sync.js';
+import { escapeMd, formatBackfillSummary, formatDayLine, formatSmokeReport } from './format.js';
 
 export interface Bot {
   start(): void;
   sendSyncSummary(results: SyncResult[]): Promise<void>;
   promptNewBook(book: AbsBookProgress): Promise<void>;
   promptBookFinished(mapping: { mappingId: number; title: string; storygraphBookUrl: string }): Promise<void>;
+  /** Ask for a star rating after a book was marked finished automatically. */
+  promptRating(mapping: { mappingId: number; title: string; storygraphBookUrl: string }): Promise<void>;
   sendError(message: string): Promise<void>;
+  /** Send a plain (Markdown) message to the configured chat. */
+  notify(text: string): Promise<void>;
 }
 
 interface CreateBotOptions {
@@ -21,11 +25,14 @@ interface CreateBotOptions {
   storygraph: StoryGraph;
   absClient: AbsClient;
   storygraphUsername?: string;
+  /** Saved StoryGraph login, used to log in again when the session expires. */
+  storygraphCreds?: { email: string; password: string };
 }
 
 export function createBot(options: CreateBotOptions): Bot {
   const { token, chatId, db, storygraph, absClient } = options;
   const storygraphUsername = options.storygraphUsername ?? 'chrisandrews';
+  const storygraphCreds = options.storygraphCreds ?? { email: '', password: '' };
 
   const bot = new TelegramBot(token, { polling: true });
 
@@ -169,6 +176,7 @@ export function createBot(options: CreateBotOptions): Bot {
       '/dnf <title> — mark a book as Did Not Finish on StoryGraph',
       '/link [title] — link an in-progress ABS book to StoryGraph (no title shows a picker)',
       '/backfill [title] — rebuild StoryGraph journal history from ABS listening sessions',
+      '/check — check that StoryGraph pages still read correctly (read-only)',
     ].join('\n'));
   });
 
@@ -216,14 +224,33 @@ export function createBot(options: CreateBotOptions): Bot {
     if (!isAuthorized(msg)) return;
     await reply(msg.chat.id, 'Starting manual sync...');
     try {
+      const login = await ensureLoggedIn(storygraph, storygraphCreds);
+      if (!login.ok) {
+        await reply(msg.chat.id, '❌ StoryGraph login failed — check STORYGRAPH\\_EMAIL / STORYGRAPH\\_PASSWORD in .env.');
+        return;
+      }
       const results = await runSync(absClient, db, storygraph,
         (book) => { promptNewBookInternal(book).catch((err) => logger.error('promptNewBook error', err)); },
-        (mapping) => { promptBookFinishedInternal(mapping).catch((err) => logger.error('promptBookFinished error', err)); }
+        (mapping) => { promptBookFinishedInternal(mapping).catch((err) => logger.error('promptBookFinished error', err)); },
+        (mapping) => { promptRatingInternal(mapping).catch((err) => logger.error('promptRating error', err)); }
       );
       await sendSyncSummaryInternal(results);
     } catch (err) {
       logger.error('/sync error', err);
       await reply(msg.chat.id, `Sync failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  });
+
+  // ── /check — read-only StoryGraph parsing check ─────────────────────────────
+  bot.onText(/^\/check/, async (msg) => {
+    if (!isAuthorized(msg)) return;
+    await reply(msg.chat.id, 'Checking StoryGraph pages (read-only)...');
+    try {
+      const login = await ensureLoggedIn(storygraph, storygraphCreds);
+      if (!login.ok) { await reply(msg.chat.id, '❌ StoryGraph login failed.'); return; }
+      await reply(msg.chat.id, formatSmokeReport(await runSmokeCheck(storygraph, db), login.relogged));
+    } catch (err) {
+      await reply(msg.chat.id, `❌ Check failed: ${escapeMd(err instanceof Error ? err.message : String(err))}`);
     }
   });
 
@@ -1087,6 +1114,11 @@ export function createBot(options: CreateBotOptions): Bot {
     await reply(chatIdTarget, prompt, { reply_markup: { inline_keyboard } });
   }
 
+  async function promptRatingInternal(mapping: { mappingId: number; title: string; storygraphBookUrl: string }): Promise<void> {
+    await reply(chatId, `🎉 *${escapeMd(mapping.title)}* is finished in Audiobookshelf and marked finished on StoryGraph.`);
+    await sendRatingPrompt(chatId, mapping.mappingId, mapping.title, mapping.storygraphBookUrl);
+  }
+
   async function promptBookFinishedInternal(mapping: { mappingId: number; title: string; storygraphBookUrl: string }): Promise<void> {
     logger.info(`Prompting finish/DNF for: ${mapping.title}`);
     await reply(chatId,
@@ -1134,6 +1166,8 @@ export function createBot(options: CreateBotOptions): Bot {
     async sendSyncSummary(results: SyncResult[]) { await sendSyncSummaryInternal(results); },
     async promptNewBook(book: AbsBookProgress) { await promptNewBookInternal(book); },
     async promptBookFinished(mapping: { mappingId: number; title: string; storygraphBookUrl: string }) { await promptBookFinishedInternal(mapping); },
+    async promptRating(mapping: { mappingId: number; title: string; storygraphBookUrl: string }) { await promptRatingInternal(mapping); },
     async sendError(message: string) { await reply(chatId, `Error: ${message}`); },
+    async notify(text: string) { await reply(chatId, text); },
   };
 }

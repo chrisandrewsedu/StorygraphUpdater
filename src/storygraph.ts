@@ -87,6 +87,11 @@ export function chooseAudioEdition(
   return chosenUrl;
 }
 
+/** The edition format ("audio", "hardcover", ...) from a book page's "Format: X" line, or null. */
+export function parseBookPageFormat(pageText: string): string | null {
+  return pageText.match(/Format:\s*([A-Za-z]+)/)?.[1]?.toLowerCase() ?? null;
+}
+
 /** The id of an entry on `date` that exists in `after` but not in `before`, or null. */
 export function pickNewEntry(
   before: StoryGraphJournalEntry[],
@@ -201,6 +206,10 @@ export interface StoryGraph {
    * `editionUrl` (journal entries follow the shelved edition). No-op otherwise.
    */
   switchToEdition(editionUrl: string): Promise<void>;
+  /** The id of the edition of this book on the user's shelf, or null if none is shelved. */
+  findShelvedEdition(bookUrl: string): Promise<string | null>;
+  /** The format of one edition ("audio", "hardcover", ...), read from its book page. */
+  getEditionFormat(bookUrl: string): Promise<string | null>;
   /** Read the dated progress (journal) entries currently on StoryGraph for a book. */
   getJournalEntries(bookUrl: string): Promise<StoryGraphJournalEntry[]>;
   /** Create a backdated audiobook journal entry for a past date. */
@@ -366,6 +375,30 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
     await page.screenshot({ path: path.join(screenshotsDir, screenshotName), fullPage: false });
   }
 
+  /**
+   * Parse the edition cards on the current editions page. A card is the LARGEST
+   * element holding exactly one "ISBN/UID:" line — smaller elements miss fields and
+   * page wrappers span every card. Cards render twice (mobile + desktop): dedupe by URL.
+   */
+  async function readEditionCards(): Promise<Map<string, StoryGraphEdition>> {
+    const cards = await page.evaluate(() => {
+      const isCard = (el: Element) => ((el.textContent || '').match(/ISBN\/UID:/g) || []).length === 1;
+      return Array.from(document.querySelectorAll('body *'))
+        .filter((el) => isCard(el) && !(el.parentElement && isCard(el.parentElement)))
+        .map((el) => ({
+          text: (el as HTMLElement).innerText || el.textContent || '',
+          href: el.querySelector('a[href^="/books/"]')?.getAttribute('href') ?? null,
+          coverUrl: el.querySelector('img')?.getAttribute('src') ?? '',
+        }));
+    });
+    const byUrl = new Map<string, StoryGraphEdition>();
+    for (const c of cards) {
+      const e = parseEditionCard(c.text, c.href);
+      if (e && !byUrl.has(e.bookUrl)) byUrl.set(e.bookUrl, { ...e, coverUrl: c.coverUrl });
+    }
+    return byUrl;
+  }
+
   const api: StoryGraph = {
     async login(email: string, password: string): Promise<boolean> {
       return withRetry('login', async () => {
@@ -483,31 +516,20 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
         await page.goto(editionsUrl, { waitUntil: 'networkidle2', timeout: 15000 });
         await handleTurnstile(editionsUrl);
 
-        // Scroll to load all editions
-        for (let i = 0; i < 3; i++) {
+        // The list loads more as you scroll (?page=N); keep scrolling until it stops growing.
+        // Capped: this is a fallback (the ISBN search finds exact editions), and a
+        // popular book can have hundreds of editions.
+        let seen = -1;
+        const deadline = Date.now() + 45_000;
+        for (let i = 0; i < 25 && Date.now() < deadline; i++) {
+          const count = await page.evaluate(() => document.querySelectorAll('a[href^="/books/"]').length);
+          if (count === seen) break;
+          seen = count;
           await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-          await sleep(1000);
+          // Wait for the next page's request to finish before comparing counts.
+          await page.waitForNetworkIdle({ idleTime: 700, timeout: 8000 }).catch(() => null);
         }
-
-        // An edition card is the LARGEST element holding exactly one "ISBN/UID:" line —
-        // smaller elements miss fields, and page wrappers span every card.
-        const cards = await page.evaluate(() => {
-          const isCard = (el: Element) => ((el.textContent || '').match(/ISBN\/UID:/g) || []).length === 1;
-          return Array.from(document.querySelectorAll('body *'))
-            .filter((el) => isCard(el) && !(el.parentElement && isCard(el.parentElement)))
-            .map((el) => ({
-              text: (el as HTMLElement).innerText || el.textContent || '',
-              href: el.querySelector('a[href^="/books/"]')?.getAttribute('href') ?? null,
-              coverUrl: el.querySelector('img')?.getAttribute('src') ?? '',
-            }));
-        });
-
-        // StoryGraph renders each card twice (mobile + desktop layouts) — dedupe by URL.
-        const byUrl = new Map<string, StoryGraphEdition>();
-        for (const c of cards) {
-          const e = parseEditionCard(c.text, c.href);
-          if (e && !byUrl.has(e.bookUrl)) byUrl.set(e.bookUrl, { ...e, coverUrl: c.coverUrl });
-        }
+        const byUrl = await readEditionCards();
         logger.info(`StoryGraph getEditions: parsed ${byUrl.size} editions`);
         return [...byUrl.values()];
       });
@@ -1030,8 +1052,57 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
       bookUrl: string,
       identifier: string
     ): Promise<StoryGraphEdition | null> {
-      const editions = await api.getEditions(bookUrl);
-      return matchEditionByIdentifier(editions, identifier);
+      // The editions page has a "Search by ISBN..." box (/search-editions) that finds the
+      // edition wherever it sits in a long, paginated list. Fall back to scanning the list.
+      const found = await withRetry('searchEditions', async () => {
+        const id = bookIdFromUrl(bookUrl);
+        if (!id) throw new Error(`Cannot extract book id from ${bookUrl}`);
+        const editionsUrl = `https://app.thestorygraph.com/books/${id}/editions`;
+        await page.goto(editionsUrl, { waitUntil: 'networkidle2', timeout: 15000 });
+        await handleTurnstile(editionsUrl);
+        const input = await page.$('input[name="search_editions"]');
+        if (!input) return null;
+        await input.type(identifier);
+        await Promise.all([
+          page.waitForResponse((r) => r.url().includes('/search-editions'), { timeout: 10000 }).catch(() => null),
+          page.evaluate(() => (document.querySelector('input[name="search_editions"]') as HTMLInputElement).form?.requestSubmit()),
+        ]);
+        await sleep(1000);
+        return matchEditionByIdentifier([...(await readEditionCards()).values()], identifier);
+      }).catch(() => null);
+      if (found) {
+        logger.info(`findEditionByIdentifier(${identifier}): ${found.format} ${found.bookUrl}`);
+        return found;
+      }
+      return matchEditionByIdentifier(await api.getEditions(bookUrl), identifier);
+    },
+
+    async getEditionFormat(bookUrl: string): Promise<string | null> {
+      return withRetry('getEditionFormat', async () => {
+        await page.goto(bookUrl, { waitUntil: 'networkidle2', timeout: 15000 });
+        await handleTurnstile(bookUrl);
+        // textContent, not innerText: the edition details sit in a collapsed (hidden) section.
+        return parseBookPageFormat(await page.evaluate(() => document.body.textContent || ''));
+      });
+    },
+
+    async findShelvedEdition(bookUrl: string): Promise<string | null> {
+      return withRetry('findShelvedEdition', async () => {
+        const id = bookIdFromUrl(bookUrl);
+        if (!id) throw new Error(`Cannot extract book id from ${bookUrl}`);
+        const editionsUrl = `https://app.thestorygraph.com/books/${id}/editions`;
+        await page.goto(editionsUrl, { waitUntil: 'networkidle2', timeout: 15000 });
+        await handleTurnstile(editionsUrl);
+        // Every "switch to this edition" form names the shelved edition as from_book_id.
+        const fromIds = await page.evaluate(() =>
+          Array.from(document.querySelectorAll('form[action="/switch-editions"] input[name="from_book_id"]')).map(
+            (i) => (i as HTMLInputElement).value
+          )
+        );
+        const unique = [...new Set(fromIds.filter(Boolean))];
+        logger.info(`findShelvedEdition(${id}): ${unique.join(', ') || 'none shelved'}`);
+        return unique.length === 1 ? unique[0] : null;
+      });
     },
 
     async switchToEdition(editionUrl: string): Promise<void> {

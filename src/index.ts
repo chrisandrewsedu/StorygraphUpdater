@@ -6,7 +6,8 @@ import { createDb } from './db.js';
 import { createAbsClient } from './abs-client.js';
 import { createStoryGraph } from './storygraph.js';
 import { createBot } from './bot.js';
-import { runSync } from './sync.js';
+import { runSync, ensureLoggedIn, runSmokeCheck } from './sync.js';
+import { formatSmokeReport } from './format.js';
 
 async function main() {
   logger.info('StoryGraph Updater starting...');
@@ -24,21 +25,10 @@ async function main() {
   const storygraph = await createStoryGraph(config.dataDir);
   logger.info('StoryGraph automator initialized');
 
-  // Check if StoryGraph login is needed
-  const loggedIn = await storygraph.isLoggedIn();
-  if (!loggedIn) {
-    if (config.storygraph.email && config.storygraph.password) {
-      logger.info('Logging into StoryGraph with env credentials...');
-      const success = await storygraph.login(config.storygraph.email, config.storygraph.password);
-      if (!success) {
-        logger.error('StoryGraph login failed. Check credentials.');
-      }
-    } else {
-      logger.warn('Not logged into StoryGraph. Use /sync after providing credentials via Telegram.');
-    }
-  } else {
-    logger.info('StoryGraph session is active');
-  }
+  const creds = { email: config.storygraph.email, password: config.storygraph.password };
+  const startLogin = await ensureLoggedIn(storygraph, creds);
+  if (!startLogin.ok) logger.error('StoryGraph login failed. Check STORYGRAPH_EMAIL / STORYGRAPH_PASSWORD.');
+  else logger.info(startLogin.relogged ? 'Logged into StoryGraph with env credentials' : 'StoryGraph session is active');
 
   // Initialize Telegram bot
   const bot = createBot({
@@ -47,6 +37,8 @@ async function main() {
     db,
     storygraph,
     absClient,
+    storygraphUsername: config.storygraph.username,
+    storygraphCreds: creds,
   });
   bot.start();
 
@@ -54,16 +46,18 @@ async function main() {
   cron.schedule(config.syncCron, async () => {
     logger.info('Running scheduled sync...');
     try {
-      // Verify StoryGraph session before sync
-      const isActive = await storygraph.isLoggedIn();
-      if (!isActive) {
-        await bot.sendError('StoryGraph session expired. Please re-authenticate.');
+      // Verify the StoryGraph session; log in again with the saved credentials if it expired.
+      const login = await ensureLoggedIn(storygraph, creds);
+      if (!login.ok) {
+        await bot.sendError('StoryGraph session expired and logging in again failed. Check STORYGRAPH_EMAIL / STORYGRAPH_PASSWORD in .env.');
         return;
       }
+      if (login.relogged) logger.info('StoryGraph session had expired — logged in again');
 
       const results = await runSync(absClient, db, storygraph,
         (book) => { bot.promptNewBook(book); },
-        (mapping) => { bot.promptBookFinished(mapping); }
+        (mapping) => { bot.promptBookFinished(mapping); },
+        (mapping) => { bot.promptRating(mapping); }
       );
       await bot.sendSyncSummary(results);
     } catch (err) {
@@ -74,6 +68,21 @@ async function main() {
   });
 
   logger.info(`Sync scheduled: ${config.syncCron}`);
+
+  // Weekly read-only check that StoryGraph pages still parse — alert only on problems.
+  cron.schedule(config.smokeCron, async () => {
+    logger.info('Running StoryGraph check...');
+    try {
+      const login = await ensureLoggedIn(storygraph, creds);
+      if (!login.ok) { await bot.sendError('Weekly StoryGraph check: login failed.'); return; }
+      const report = await runSmokeCheck(storygraph, db);
+      logger.info(`StoryGraph check: ${report.problems.length ? report.problems.join('; ') : 'ok'}`);
+      if (report.problems.length) await bot.notify(formatSmokeReport(report));
+    } catch (err) {
+      await bot.sendError(`Weekly StoryGraph check failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  });
+  logger.info(`StoryGraph check scheduled: ${config.smokeCron}`);
   logger.info('StoryGraph Updater is running.');
 
   // Graceful shutdown

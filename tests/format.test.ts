@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { escapeMd, formatDayLine, formatBackfillSummary } from '../src/format.js';
+import { escapeMd, formatDayLine, formatBackfillSummary, formatSmokeReport } from '../src/format.js';
 import type { SyncResult } from '../src/sync.js';
 
 const write = (date: string, dayMinutes: number, totalMinutes: number, percent: number | undefined): SyncResult => ({
@@ -63,5 +63,24 @@ describe('formatBackfillSummary', () => {
     const lines = formatBackfillSummary(many, 'Long').split('\n');
     expect(lines).toHaveLength(1 + 60 + 1);
     expect(lines.at(-1)).toBe('…and 5 more day(s)');
+  });
+});
+
+describe('formatSmokeReport', () => {
+  it('reports a pass', () => {
+    expect(formatSmokeReport({ checked: 'Exit Party', problems: [] }))
+      .toBe('✅ StoryGraph check passed (search, editions, journal) using *Exit Party*.');
+  });
+
+  it('lists each problem', () => {
+    expect(formatSmokeReport({ checked: 'Exit Party', problems: ['journal page parsed no entries'] })).toBe(
+      '⚠️ *StoryGraph check found problems* using *Exit Party* — the site may have changed:\n• journal page parsed no entries'
+    );
+  });
+
+  it('mentions a fresh login and handles no book to check', () => {
+    expect(formatSmokeReport({ checked: null, problems: [] }, true)).toBe(
+      'ℹ️ StoryGraph check skipped: no synced book to check against yet.\n(Logged in to StoryGraph again — the old session had expired.)'
+    );
   });
 });

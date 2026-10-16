@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { determineSyncActions, diffDailyProgress, reconcileBook, runSync, type SyncAction } from '../src/sync.js';
+import { determineSyncActions, diffDailyProgress, reconcileBook, runSync, ensureLoggedIn, runSmokeCheck, linkBook, type SyncAction } from '../src/sync.js';
 import { createDb, type Database } from '../src/db.js';
 import type { AbsClient, AbsDayProgress, AbsListeningSession } from '../src/abs-client.js';
 import type { StoryGraph, StoryGraphJournalEntry } from '../src/storygraph.js';
@@ -173,6 +173,7 @@ function fakeStoryGraph(journal: StoryGraphJournalEntry[] = []) {
   const sg: Partial<StoryGraph> = {
     async markAsReading(url) { calls.markAsReading.push(url); },
     async setStartDate(url, date) { calls.setStartDate.push(date); },
+    async findShelvedEdition() { return null; }, // shelf still on the mapped edition
     async getJournalEntries() { return journal; },
     async addBackdatedProgress(url, date, p) { calls.addBackdatedProgress.push({ date, minutes: p.totalMinutes }); calls.progress = [...(calls.progress ?? []), p]; },
     async deleteJournalEntry(id) { calls.deleteJournalEntry.push(id); },
@@ -295,8 +296,10 @@ describe('runSync — books that left ABS in-progress', () => {
   it('writes the remaining days and marks the book finished when ABS says it is finished', async () => {
     const { sg, calls } = fakeStoryGraph([]);
     const prompted: string[] = [];
-    await runSync(fakeAbs(true), db, sg, () => {}, (m) => prompted.push(m.title));
+    const autoFinished: string[] = [];
+    await runSync(fakeAbs(true), db, sg, () => {}, (m) => prompted.push(m.title), (m) => autoFinished.push(m.title));
 
+    expect(autoFinished).toEqual(['Done Book']); // the bot asks for a star rating
     expect(calls.addBackdatedProgress.map((c: any) => c.date)).toEqual(['2026-05-29', '2026-05-30']);
     expect(calls.markAsRead).toEqual(['https://app.thestorygraph.com/books/done']);
     expect(prompted).toEqual([]); // no "did you finish it?" prompt needed
@@ -320,5 +323,185 @@ describe('runSync — books that left ABS in-progress', () => {
     await runSync(fakeAbs(false), db, sg, () => {}, (m) => prompted.push(m.title));
     expect(prompted).toEqual(['Done Book']);
     expect(calls.markAsRead).toEqual([]);
+  });
+});
+
+describe('ensureLoggedIn', () => {
+  const fake = (loggedIn: boolean, loginResult: boolean) => {
+    const calls = { login: 0 };
+    const sg = {
+      async isLoggedIn() { return loggedIn; },
+      async login() { calls.login++; return loginResult; },
+    } as unknown as StoryGraph;
+    return { sg, calls };
+  };
+  const creds = { email: 'a@b.c', password: 'pw' };
+
+  it('does nothing when the session is still active', async () => {
+    const { sg, calls } = fake(true, true);
+    expect(await ensureLoggedIn(sg, creds)).toEqual({ ok: true, relogged: false });
+    expect(calls.login).toBe(0);
+  });
+
+  it('logs in again with the saved credentials when the session expired', async () => {
+    const { sg, calls } = fake(false, true);
+    expect(await ensureLoggedIn(sg, creds)).toEqual({ ok: true, relogged: true });
+    expect(calls.login).toBe(1);
+  });
+
+  it('reports failure when the login is rejected', async () => {
+    const { sg } = fake(false, false);
+    expect(await ensureLoggedIn(sg, creds)).toEqual({ ok: false, relogged: false });
+  });
+
+  it('does not try to log in without credentials', async () => {
+    const { sg, calls } = fake(false, true);
+    expect(await ensureLoggedIn(sg, { email: '', password: '' })).toEqual({ ok: false, relogged: false });
+    expect(calls.login).toBe(0);
+  });
+});
+
+describe('reconcileBook — edition switched by hand on StoryGraph', () => {
+  const DIR = path.resolve('./data/test');
+  const DB_PATH = path.join(DIR, 'edition.db');
+  const OLD = 'https://app.thestorygraph.com/books/01d00000-0000-0000-0000-000000000000';
+  const NEW = 'https://app.thestorygraph.com/books/0e0e0000-0000-0000-0000-000000000000';
+  let db: Database;
+
+  beforeEach(() => {
+    fs.mkdirSync(DIR, { recursive: true });
+    fs.rmSync(DB_PATH, { force: true });
+    db = createDb(DB_PATH);
+    db.upsertBookMapping({ absLibraryItemId: 'li_e', storygraphBookUrl: OLD, title: 'Switched', author: 'A', editionType: 'audio' });
+    db.upsertJournalEntry({ bookMappingId: db.getBookMappingByAbsId('li_e')!.id, entryDate: '2026-05-28', minutes: 30, status: 'success' });
+  });
+  afterEach(() => { db.close(); fs.rmSync(DB_PATH, { force: true }); });
+
+  // Journal entries follow the shelved edition: the old URL now reads empty.
+  function sgWithShelf(shelvedFormat: string) {
+    const writes: string[] = [];
+    const sg: Partial<StoryGraph> = {
+      async getJournalEntries(url) {
+        return url === NEW ? [{ entryId: 'e1', date: '2026-05-28', minutes: 30, percent: 5 }] : [];
+      },
+      async findShelvedEdition() { return '0e0e0000-0000-0000-0000-000000000000'; },
+      async getEditionFormat() { return shelvedFormat; },
+      async markAsReading() {},
+      async setStartDate() {},
+      async addBackdatedProgress(url, date) { writes.push(`${url}|${date}`); },
+      async recalculateStreak() {},
+    };
+    return { sg: sg as StoryGraph, writes };
+  }
+
+  it('follows the shelf to the new audio edition and keeps syncing there', async () => {
+    const { sg, writes } = sgWithShelf('audio');
+    const m = db.getBookMappingByAbsId('li_e')!;
+    const results = await reconcileBook(sg, db, m, [day('2026-05-28', 30), day('2026-05-29', 60)], false, NOW);
+    expect(db.getBookMappingByAbsId('li_e')!.storygraphBookUrl).toBe(NEW);
+    expect(results[0]).toMatchObject({ action: 'edition_changed', success: true });
+    expect(writes).toEqual([`${NEW}|2026-05-29`]);
+  });
+
+  it('stops with a clear error when the shelf moved to a print edition', async () => {
+    const { sg, writes } = sgWithShelf('hardcover');
+    const m = db.getBookMappingByAbsId('li_e')!;
+    const results = await reconcileBook(sg, db, m, [day('2026-05-28', 30), day('2026-05-29', 60)], false, NOW);
+    expect(writes).toEqual([]);
+    expect(results).toEqual([
+      expect.objectContaining({ action: 'edition_changed', success: false, error: expect.stringContaining('hardcover') }),
+    ]);
+    expect(db.getBookMappingByAbsId('li_e')!.storygraphBookUrl).toBe(OLD); // unchanged until fixed
+  });
+});
+
+describe('runSmokeCheck', () => {
+  const DIR = path.resolve('./data/test');
+  const DB_PATH = path.join(DIR, 'smoke.db');
+  const URL = 'https://app.thestorygraph.com/books/50e00000-0000-0000-0000-000000000000';
+  let db: Database;
+
+  beforeEach(() => {
+    fs.mkdirSync(DIR, { recursive: true });
+    fs.rmSync(DB_PATH, { force: true });
+    db = createDb(DB_PATH);
+    db.upsertBookMapping({ absLibraryItemId: 'li_s', storygraphBookUrl: URL, title: 'Smoke Book', author: 'A', editionType: 'audio' });
+    db.upsertJournalEntry({ bookMappingId: db.getBookMappingByAbsId('li_s')!.id, entryDate: '2026-05-28', minutes: 30, status: 'success' });
+  });
+  afterEach(() => { db.close(); fs.rmSync(DB_PATH, { force: true }); });
+
+  const healthy: Partial<StoryGraph> = {
+    async searchBooks() { return [{ title: 'Smoke Book', author: 'A', bookUrl: URL, editionInfo: '', coverUrl: '' }]; },
+    async getEditions() { return [{ title: 'Smoke Book', format: 'audio', info: '', bookUrl: URL, coverUrl: '', isbn: '1' }]; },
+    async getJournalEntries() { return [{ entryId: 'e', date: '2026-05-28', minutes: 30, percent: 5 }]; },
+  };
+
+  it('reports no problems when every page parses', async () => {
+    expect(await runSmokeCheck(healthy as StoryGraph, db)).toEqual({ checked: 'Smoke Book', problems: [] });
+  });
+
+  it('flags each part of the site that stopped parsing', async () => {
+    const broken = {
+      ...healthy,
+      async getEditions() { return []; },
+      async getJournalEntries() { return [{ entryId: 'e', date: '2026-05-28', minutes: null, percent: null }]; },
+    } as StoryGraph;
+    const { problems } = await runSmokeCheck(broken, db);
+    expect(problems).toHaveLength(2);
+    expect(problems.join(' ')).toMatch(/editions/);
+    expect(problems.join(' ')).toMatch(/minutes/);
+  });
+
+  it('reports a thrown error as a problem instead of crashing', async () => {
+    const throwing = { ...healthy, async searchBooks() { throw new Error('timeout'); } } as StoryGraph;
+    const { problems } = await runSmokeCheck(throwing, db);
+    expect(problems).toEqual([expect.stringContaining('timeout')]);
+  });
+});
+
+describe('linkBook', () => {
+  const DIR = path.resolve('./data/test');
+  const DB_PATH = path.join(DIR, 'link.db');
+  const PRINT = 'https://app.thestorygraph.com/books/aaaa0000-0000-0000-0000-000000000000';
+  const AUDIO = 'https://app.thestorygraph.com/books/bbbb0000-0000-0000-0000-000000000000';
+  let db: Database;
+  beforeEach(() => { fs.mkdirSync(DIR, { recursive: true }); fs.rmSync(DB_PATH, { force: true }); db = createDb(DB_PATH); });
+  afterEach(() => { db.close(); fs.rmSync(DB_PATH, { force: true }); });
+
+  const absBook = { absLibraryItemId: 'li_l', title: 'Big Book', author: 'A', durationSeconds: 1, progressPercent: 1,
+    currentTimeSeconds: 1, isFinished: false, lastUpdate: 0, coverPath: '', asin: 'B0AUDIO', isbn: '9781111111111' };
+
+  it('finds the audio edition with the ISBN search, even when it is not in the first page of editions', async () => {
+    const calls = { getEditions: 0, switched: [] as string[], searched: [] as string[] };
+    const sg: Partial<StoryGraph> = {
+      async findEditionByIdentifier(_url, id) {
+        calls.searched.push(id);
+        return id === '9781111111111' ? { title: 'Big Book', format: 'audio', info: '', bookUrl: AUDIO, coverUrl: '', isbn: id } : null;
+      },
+      async getEditions() { calls.getEditions++; return [{ title: 'Big Book', format: 'hardcover', info: '', bookUrl: PRINT, coverUrl: '', isbn: '1' }]; },
+      async switchToEdition(url) { calls.switched.push(url); },
+      async markAsReading() {},
+    };
+    const m = await linkBook(db, sg as StoryGraph, 'li_l', absBook, PRINT);
+    expect(m.storygraphBookUrl).toBe(AUDIO);
+    expect(calls.searched).toEqual(['B0AUDIO', '9781111111111']); // ASIN first, then ISBN
+    expect(calls.getEditions).toBe(0);
+    expect(calls.switched).toEqual([AUDIO]);
+  });
+
+  it('falls back to scanning the editions list when the ISBN search finds no audio edition', async () => {
+    const sg: Partial<StoryGraph> = {
+      async findEditionByIdentifier() { return null; },
+      async getEditions() {
+        return [
+          { title: 'Big Book', format: 'hardcover', info: '', bookUrl: PRINT, coverUrl: '', isbn: '1' },
+          { title: 'Big Book', format: 'audio', info: '', bookUrl: AUDIO, coverUrl: '', isbn: '2' },
+        ];
+      },
+      async switchToEdition() {},
+      async markAsReading() {},
+    };
+    const m = await linkBook(db, sg as StoryGraph, 'li_l', absBook, PRINT);
+    expect(m.storygraphBookUrl).toBe(AUDIO);
   });
 });

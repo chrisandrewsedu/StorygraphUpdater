@@ -37,3 +37,16 @@ export function formatBackfillSummary(results: SyncResult[], title: string): str
   if (fails.length) lines.push(`⚠️ ${fails.length} failed: ${escapeMd(fails.slice(0, 3).map((f) => f.error ?? '').join('; '))}`);
   return lines.join('\n');
 }
+
+/** Telegram message for the read-only StoryGraph check (weekly cron and /check). */
+export function formatSmokeReport(report: { checked: string | null; problems: string[] }, relogged = false): string {
+  const login = relogged ? '\n(Logged in to StoryGraph again — the old session had expired.)' : '';
+  if (!report.checked) return `ℹ️ StoryGraph check skipped: no synced book to check against yet.${login}`;
+  if (!report.problems.length) {
+    return `✅ StoryGraph check passed (search, editions, journal) using *${escapeMd(report.checked)}*.${login}`;
+  }
+  return [
+    `⚠️ *StoryGraph check found problems* using *${escapeMd(report.checked)}* — the site may have changed:`,
+    ...report.problems.map((p) => `• ${escapeMd(p)}`),
+  ].join('\n') + login;
+}

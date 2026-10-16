@@ -26,5 +26,7 @@ export const config = {
     username: process.env.STORYGRAPH_USERNAME || 'chrisandrews',
   },
   syncCron: process.env.SYNC_CRON || '0 22 * * *',
+  /** Weekly read-only check that StoryGraph pages still parse (default Sunday 04:15). */
+  smokeCron: process.env.SMOKE_CRON || '15 4 * * 0',
   dataDir: path.resolve(process.env.DATA_DIR || './data'),
 };
