@@ -92,6 +92,34 @@ export function parseBookPageFormat(pageText: string): string | null {
   return pageText.match(/Format:\s*([A-Za-z]+)/)?.[1]?.toLowerCase() ?? null;
 }
 
+/**
+ * Wrap every async method so calls run one at a time, in call order. StoryGraph is
+ * driven through ONE browser tab: a Telegram command (e.g. the new-book search)
+ * running during the nightly sync would otherwise abort the sync's page load.
+ * Methods that call each other internally use the unwrapped object, so no deadlock.
+ */
+export function serializeMethods<T extends object>(obj: T): T {
+  let tail: Promise<unknown> = Promise.resolve();
+  const wrapped: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(obj)) {
+    if (typeof value !== 'function') {
+      wrapped[key] = value;
+      continue;
+    }
+    wrapped[key] = (...args: unknown[]) => {
+      const run = tail.then(() => (value as (...a: unknown[]) => unknown).apply(obj, args));
+      tail = run.catch(() => undefined); // a failed call must not block the queue
+      return run;
+    };
+  }
+  return wrapped as T;
+}
+
+/** The review form's stars_decimal option for a quarter-star fraction (half is "5", not "50"). */
+export function starsDecimalValue(fraction: 0 | 25 | 50 | 75): string {
+  return { 0: '', 25: '25', 50: '5', 75: '75' }[fraction];
+}
+
 /** The id of an entry on `date` that exists in `after` but not in `before`, or null. */
 export function pickNewEntry(
   before: StoryGraphJournalEntry[],
@@ -788,167 +816,33 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
 
     async rateBook(bookUrl: string, wholeStars: number, fraction: 0 | 25 | 50 | 75): Promise<void> {
       return withRetry('rateBook', async () => {
-        logger.info(`StoryGraph rateBook: navigating to ${bookUrl} — rating ${wholeStars}.${fraction}`);
-        await page.goto(bookUrl, { waitUntil: 'networkidle2', timeout: 15000 });
-        await handleTurnstile(bookUrl);
+        const bookId = bookIdFromUrl(bookUrl);
+        if (!bookId) throw new Error(`Cannot extract book id from ${bookUrl}`);
+        // A rating is a review with stars and no text. The book page's "add review"
+        // link opens /reviews/new, whose form posts to /reviews with stars_integer
+        // (0-5) and stars_decimal ("", "25", "5", "75").
+        const reviewUrl = `https://app.thestorygraph.com/reviews/new?book_id=${bookId}`;
+        logger.info(`StoryGraph rateBook: ${reviewUrl} — ${wholeStars}.${fraction} stars`);
+        await page.goto(reviewUrl, { waitUntil: 'networkidle2', timeout: 15000 });
+        await handleTurnstile(reviewUrl);
 
-        await page.screenshot({ path: path.join(screenshotsDir, 'debug-rate-before.png'), fullPage: false });
-
-        // Step 1: Click the "Write a Review" or rating button to reveal the form
-        const clickResult = await page.evaluate(() => {
-          // StoryGraph shows a "Write a Review" link or star rating widget on the book page
-          const allLinks = Array.from(document.querySelectorAll('a, button'));
-          const reviewLink = allLinks.find((el) => {
-            const text = el.textContent?.trim().toLowerCase() ?? '';
-            const href = (el as HTMLAnchorElement).href ?? '';
-            return (
-              text.includes('write a review') ||
-              text.includes('add review') ||
-              text.includes('review this book') ||
-              href.includes('book_reviews')
-            );
-          });
-          if (reviewLink) {
-            (reviewLink as HTMLElement).click();
-            return { clicked: 'review_link', text: reviewLink.textContent?.trim().slice(0, 40) };
-          }
-
-          // Fallback: look for the star rating widget (often a row of star SVGs)
-          const starWidget = document.querySelector(
-            '[class*="star-rating"], [class*="rating"], [data-rating], [aria-label*="rate"]'
-          ) as HTMLElement | null;
-          if (starWidget) {
-            starWidget.click();
-            return { clicked: 'star_widget', cls: starWidget.className.slice(0, 40) };
-          }
-
-          return { clicked: 'none' };
-        });
-
-        logger.info(`rateBook: click result: ${JSON.stringify(clickResult)}`);
-        await sleep(1500);
-        await page.screenshot({ path: path.join(screenshotsDir, 'debug-rate-after-click.png'), fullPage: true });
-
-        // Step 2: Wait for a review form to appear and discover its structure
-        const formDiscovery = await page.evaluate(() => {
-          const forms = Array.from(document.querySelectorAll('form'));
-          const reviewForm = forms.find((f) => {
-            const action = f.getAttribute('action') ?? '';
-            return action.includes('book_review') || action.includes('review');
-          });
-          if (!reviewForm) {
-            return {
-              found: false,
-              forms: forms.map((f) => f.getAttribute('action')).filter(Boolean).slice(0, 5),
-            };
-          }
-
-          const selects = Array.from(reviewForm.querySelectorAll('select')).map((s) => ({
-            name: s.name,
-            options: Array.from(s.options).map((o) => ({ value: o.value, text: o.text })),
-          }));
-          const inputs = Array.from(reviewForm.querySelectorAll('input[type!="hidden"]')).map((i) => ({
-            name: (i as HTMLInputElement).name,
-            type: (i as HTMLInputElement).type,
-          }));
-          const token = (reviewForm.querySelector('input[name="authenticity_token"]') as HTMLInputElement | null)?.value
-            || document.querySelector('meta[name="csrf-token"]')?.getAttribute('content')
-            || '';
-          const bookId = (reviewForm.querySelector('input[name*="book_id"]') as HTMLInputElement | null)?.value ?? '';
-
-          return {
-            found: true,
-            action: reviewForm.getAttribute('action'),
-            method: reviewForm.getAttribute('method'),
-            selects,
-            inputs,
-            token: token.slice(0, 20) + '…',
-            bookId,
-          };
-        });
-
-        logger.info(`rateBook: form discovery: ${JSON.stringify(formDiscovery)}`);
-
-        if (!formDiscovery.found) {
-          // Navigate directly to the new-review page as a fallback
-          logger.info('rateBook: form not found after click, trying direct navigation to review page');
-          // Extract book id from the URL — StoryGraph book URLs: /books/<slug>
-          // The review URL is /book_reviews/new?book_id=<slug> or similar
-          await page.screenshot({ path: path.join(screenshotsDir, 'fail-rate-no-form.png'), fullPage: true });
-          throw new Error('Review form not found on the page. Check fail-rate-no-form.png screenshot.');
+        const F = 'form:has(select[name="stars_integer"])';
+        await page.waitForSelector(`${F} select[name="stars_integer"]`, { timeout: 8000 });
+        await page.select(`${F} select[name="stars_integer"]`, String(wholeStars));
+        await page.select(`${F} select[name="stars_decimal"]`, starsDecimalValue(fraction));
+        await Promise.all([
+          page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => null),
+          page.evaluate((sel: string) => {
+            const form = document.querySelector(sel) as HTMLFormElement;
+            form.noValidate = true; // the "href" link field is spuriously required
+            form.requestSubmit((form.querySelector('button[type="submit"]') as HTMLButtonElement | null) ?? undefined);
+          }, F),
+        ]);
+        logger.info(`rateBook: submitted, now on ${page.url()}`);
+        if (page.url().includes('/reviews/new')) {
+          await takeFailureScreenshot('rateBook-not-saved');
+          throw new Error('Rating was not saved (still on the review form)');
         }
-
-        // Step 3: Submit the rating via fetch
-        const submitResult = await page.evaluate(
-          async (whole: number, frac: number) => {
-            const forms = Array.from(document.querySelectorAll('form'));
-            const reviewForm = forms.find((f) => {
-              const action = f.getAttribute('action') ?? '';
-              return action.includes('book_review') || action.includes('review');
-            }) as HTMLFormElement | null;
-            if (!reviewForm) return { ok: false, error: 'form disappeared' };
-
-            const action = reviewForm.getAttribute('action') ?? '';
-            const method = (reviewForm.getAttribute('method') ?? 'post').toUpperCase();
-
-            const token =
-              (reviewForm.querySelector('input[name="authenticity_token"]') as HTMLInputElement | null)?.value ||
-              document.querySelector('meta[name="csrf-token"]')?.getAttribute('content') ||
-              '';
-
-            // Collect all hidden inputs from the form
-            const hiddenParams: Record<string, string> = {};
-            reviewForm.querySelectorAll('input[type="hidden"]').forEach((inp) => {
-              const i = inp as HTMLInputElement;
-              if (i.name && i.name !== 'authenticity_token') hiddenParams[i.name] = i.value;
-            });
-
-            // Determine the select field names from the form
-            const selects = Array.from(reviewForm.querySelectorAll('select'));
-            const starSelect = selects.find((s) => s.name.toLowerCase().includes('star') && !s.name.toLowerCase().includes('fraction'));
-            const fracSelect = selects.find((s) => s.name.toLowerCase().includes('fraction'));
-
-            const starFieldName = starSelect?.name ?? 'book_review[star_rating]';
-            const fracFieldName = fracSelect?.name ?? 'book_review[star_rating_fraction]';
-
-            const body = new URLSearchParams({
-              authenticity_token: token,
-              ...hiddenParams,
-              [starFieldName]: String(whole),
-              [fracFieldName]: String(frac),
-            });
-
-            try {
-              const res = await fetch(action, {
-                method,
-                headers: {
-                  'Content-Type': 'application/x-www-form-urlencoded',
-                  'X-CSRF-Token': token,
-                  'X-Requested-With': 'XMLHttpRequest',
-                  Accept: 'text/javascript, application/javascript, text/html, */*',
-                },
-                body: body.toString(),
-                credentials: 'include',
-              });
-              const text = await res.text();
-              return { ok: res.ok, status: res.status, body: text.slice(0, 300) };
-            } catch (e: any) {
-              return { ok: false, error: e.message };
-            }
-          },
-          wholeStars,
-          fraction
-        );
-
-        logger.info(`rateBook: submit result: ${JSON.stringify(submitResult)}`);
-
-        if (!submitResult.ok) {
-          await page.screenshot({ path: path.join(screenshotsDir, 'fail-rate-submit.png'), fullPage: true });
-          throw new Error(`Rating submission failed: ${JSON.stringify(submitResult)}`);
-        }
-
-        await sleep(1000);
-        await page.screenshot({ path: path.join(screenshotsDir, 'debug-rate-after.png'), fullPage: false });
         logger.info(`Rated ${bookUrl}: ${wholeStars}.${fraction} stars`);
       });
     },
@@ -1402,5 +1296,5 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
     },
   };
 
-  return api;
+  return serializeMethods(api);
 }

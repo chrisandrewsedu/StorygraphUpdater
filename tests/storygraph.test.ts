@@ -10,6 +10,8 @@ import {
   chooseAudioEdition,
   pickNewEntry,
   parseBookPageFormat,
+  starsDecimalValue,
+  serializeMethods,
   type StoryGraphEdition,
   type StoryGraphBook,
 } from '../src/storygraph.js';
@@ -250,5 +252,39 @@ describe('parseBookPageFormat', () => {
   });
   it('returns null when no format is shown', () => {
     expect(parseBookPageFormat('no edition info')).toBeNull();
+  });
+});
+
+describe('starsDecimalValue', () => {
+  it("maps quarter-star fractions to the review form's stars_decimal options", () => {
+    expect(starsDecimalValue(0)).toBe('');
+    expect(starsDecimalValue(25)).toBe('25');
+    expect(starsDecimalValue(50)).toBe('5'); // the form's half-star option is "5", not "50"
+    expect(starsDecimalValue(75)).toBe('75');
+  });
+});
+
+describe('serializeMethods', () => {
+  const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+  it('runs concurrent calls one at a time, in call order', async () => {
+    const log: string[] = [];
+    const obj = serializeMethods({
+      async a() { log.push('a start'); await wait(30); log.push('a end'); return 1; },
+      async b() { log.push('b start'); await wait(5); log.push('b end'); return 2; },
+    });
+    const results = await Promise.all([obj.a(), obj.b()]);
+    expect(results).toEqual([1, 2]);
+    expect(log).toEqual(['a start', 'a end', 'b start', 'b end']);
+  });
+
+  it('keeps going after a call fails', async () => {
+    const obj = serializeMethods({
+      async bad() { throw new Error('boom'); },
+      async good() { return 'ok'; },
+    });
+    const [bad, good] = await Promise.allSettled([obj.bad(), obj.good()]);
+    expect(bad.status).toBe('rejected');
+    expect(good).toEqual({ status: 'fulfilled', value: 'ok' });
   });
 });
