@@ -67,24 +67,46 @@ export function parseEditionCard(cardText: string, bookHref: string | null): Sto
   };
 }
 
+/** Which kind of edition a book is tracked on: audio (minutes) or digital (percent). */
+export type EditionKind = 'audio' | 'digital';
+
+export function isAudioFormat(format: string | null | undefined): boolean {
+  return format === 'audio' || format === 'audiobook';
+}
+
+export function isDigitalFormat(format: string | null | undefined): boolean {
+  return format === 'digital' || format === 'ebook' || format === 'kindle';
+}
+
 /**
- * Pick the audio edition to track an audiobook against. Journal minutes are only
- * kept on audio editions — a print edition records "0 pages" instead. Prefers the
- * audio edition matching ABS's ASIN/ISBN, then the chosen URL if it is already
- * audio, then the only audio edition. Otherwise keeps the chosen URL.
+ * Pick the edition of the given kind to track a book against: audio for an
+ * audiobook (journal minutes are only kept on audio editions; print records
+ * "0 pages"), digital for an ebook. Prefers the edition matching ABS's
+ * ASIN/ISBN, then the chosen URL if it is already that kind, then the only
+ * edition of that kind. Otherwise keeps the chosen URL.
  */
+export function chooseEdition(
+  editions: StoryGraphEdition[],
+  chosenUrl: string,
+  ids: { asin: string | null | undefined; isbn: string | null | undefined },
+  kind: EditionKind
+): string {
+  const isKind = kind === 'audio' ? isAudioFormat : isDigitalFormat;
+  const ofKind = editions.filter((e) => isKind(e.format));
+  const byId = matchEditionByIdentifier(ofKind, ids.asin) ?? matchEditionByIdentifier(ofKind, ids.isbn);
+  if (byId) return byId.bookUrl;
+  if (ofKind.some((e) => e.bookUrl === chosenUrl)) return chosenUrl;
+  const unique = new Set(ofKind.map((e) => e.bookUrl));
+  if (unique.size === 1) return ofKind[0].bookUrl;
+  return chosenUrl;
+}
+
 export function chooseAudioEdition(
   editions: StoryGraphEdition[],
   chosenUrl: string,
   ids: { asin: string | null | undefined; isbn: string | null | undefined }
 ): string {
-  const audio = editions.filter((e) => e.format === 'audio' || e.format === 'audiobook');
-  const byId = matchEditionByIdentifier(audio, ids.asin) ?? matchEditionByIdentifier(audio, ids.isbn);
-  if (byId) return byId.bookUrl;
-  if (audio.some((e) => e.bookUrl === chosenUrl)) return chosenUrl;
-  const uniqueAudio = new Set(audio.map((e) => e.bookUrl));
-  if (uniqueAudio.size === 1) return audio[0].bookUrl;
-  return chosenUrl;
+  return chooseEdition(editions, chosenUrl, ids, 'audio');
 }
 
 /** The edition format ("audio", "hardcover", ...) from a book page's "Format: X" line, or null. */
@@ -242,6 +264,12 @@ export interface StoryGraph {
   getJournalEntries(bookUrl: string): Promise<StoryGraphJournalEntry[]>;
   /** Create a backdated audiobook journal entry for a past date. */
   addBackdatedProgress(bookUrl: string, date: string, progress: JournalProgress): Promise<void>;
+  /**
+   * Create a dated reading-progress entry as a percent (ebooks on a digital
+   * edition). Unlike minutes, the create form's percent field is a plain number
+   * input, so one step is enough. Throws if no new entry appears for `date`.
+   */
+  addPercentProgress(bookUrl: string, date: string, percent: number): Promise<void>;
   /** Set day/total minutes, percent and date on an existing journal entry via the edit endpoint. */
   setEntryMinutes(entryId: string, date: string, progress: JournalProgress): Promise<void>;
   /** Move the "Started reading" date of the current read to `date` ('YYYY-MM-DD'). */
@@ -1177,6 +1205,60 @@ export async function createStoryGraph(dataDir: string): Promise<StoryGraph> {
         }
         await api.setEntryMinutes(entryId, date, progress);
         logger.info(`addBackdatedProgress(${date}, ${progress.totalMinutes}m): entry ${entryId}`);
+      });
+    },
+
+    async addPercentProgress(bookUrl: string, date: string, percent: number): Promise<void> {
+      return withRetry('addPercentProgress', async () => {
+        const bookId = bookIdFromUrl(bookUrl);
+        if (!bookId) throw new Error(`Cannot extract book id from ${bookUrl}`);
+        const formUrl = `https://app.thestorygraph.com/progress-update?book_id=${bookId}&return_to=${encodeURIComponent(bookUrl)}`;
+        const [year, month, day] = date.split('-').map((n) => String(parseInt(n, 10)));
+        const F = 'form[action="/update-progress-with-note"]';
+
+        const before = await api.getJournalEntries(bookUrl);
+
+        await page.goto(formUrl, { waitUntil: 'networkidle2', timeout: 20000 });
+        await handleTurnstile(formUrl);
+        await page.waitForSelector(`${F} input[name="progress_number"]`, { timeout: 8000 });
+        // Digital/print editions offer "pages" or "percentage" (audio offers minutes).
+        const types = await page.$$eval(`${F} select[name="progress_type"] option`, (os) =>
+          os.map((o) => (o as HTMLOptionElement).value)
+        );
+        if (!types.includes('percentage')) {
+          throw new Error(`addPercentProgress: no percentage option (got ${types.join(', ')}) — is the edition audio?`);
+        }
+        await page.select(`${F} select[name="progress_type"]`, 'percentage');
+        await page.select(`${F} select[name="progress_update_date[day]"]`, day).catch(() => null);
+        await page.select(`${F} select[name="progress_update_date[month]"]`, month).catch(() => null);
+        await page.select(`${F} select[name="progress_update_date[year]"]`, year).catch(() => null);
+        await page.evaluate(
+          (sel: string, pct: string) => {
+            const form = document.querySelector(sel) as HTMLFormElement | null;
+            if (!form) return;
+            const input = form.querySelector('input[name="progress_number"]') as HTMLInputElement;
+            input.value = pct;
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+            form.noValidate = true; // the "href" link field is spuriously required
+            form.requestSubmit((form.querySelector('button[type="submit"]') as HTMLButtonElement | null) ?? undefined);
+          },
+          F,
+          String(percent)
+        );
+        await page
+          .waitForFunction(() => !location.pathname.includes('/progress-update'), { timeout: 12000 })
+          .catch(() => null);
+        await sleep(800);
+
+        const entries = await api.getJournalEntries(bookUrl);
+        const entryId = pickNewEntry(before, entries, date);
+        if (!entryId) throw new Error(`addPercentProgress: no new entry for ${date} after submitting`);
+        const recorded = entries.find((e) => e.entryId === entryId)?.percent ?? null;
+        if (recorded !== percent) {
+          logger.warn(`addPercentProgress(${date}, ${percent}%): entry ${entryId} reads ${recorded}% on the journal`);
+        }
+        logger.info(`addPercentProgress(${date}, ${percent}%): entry ${entryId}`);
       });
     },
 

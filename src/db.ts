@@ -18,7 +18,8 @@ export interface JournalEntry {
   id: number;
   bookMappingId: number;
   entryDate: string; // 'YYYY-MM-DD'
-  minutes: number;
+  minutes: number; // 0 for ebook (digital) entries
+  percent: number | null; // reading position for ebook entries; null for audio entries
   status: string;
   syncedAt: string;
 }
@@ -59,6 +60,7 @@ export interface Database {
     bookMappingId: number;
     entryDate: string;
     minutes: number;
+    percent?: number | null;
     status: string;
   }): void;
   setConfig(key: string, value: string): void;
@@ -117,6 +119,10 @@ export function createDb(dbPath: string): Database {
   );
   if (!mappingCols.has('asin')) db.exec(`ALTER TABLE book_mappings ADD COLUMN asin TEXT`);
   if (!mappingCols.has('isbn')) db.exec(`ALTER TABLE book_mappings ADD COLUMN isbn TEXT`);
+  const journalCols = new Set(
+    (db.prepare(`PRAGMA table_info(journal_entries)`).all() as { name: string }[]).map((c) => c.name)
+  );
+  if (!journalCols.has('percent')) db.exec(`ALTER TABLE journal_entries ADD COLUMN percent INTEGER`);
 
   const stmts = {
     upsertMapping: db.prepare(`
@@ -157,14 +163,15 @@ export function createDb(dbPath: string): Database {
     `),
     getJournalEntries: db.prepare(`
       SELECT id, book_mapping_id as bookMappingId, entry_date as entryDate,
-             minutes, status, synced_at as syncedAt
+             minutes, percent, status, synced_at as syncedAt
       FROM journal_entries WHERE book_mapping_id = ? ORDER BY entry_date ASC
     `),
     upsertJournalEntry: db.prepare(`
-      INSERT INTO journal_entries (book_mapping_id, entry_date, minutes, status)
-      VALUES (@bookMappingId, @entryDate, @minutes, @status)
+      INSERT INTO journal_entries (book_mapping_id, entry_date, minutes, percent, status)
+      VALUES (@bookMappingId, @entryDate, @minutes, @percent, @status)
       ON CONFLICT(book_mapping_id, entry_date) DO UPDATE SET
         minutes = @minutes,
+        percent = @percent,
         status = @status,
         synced_at = datetime('now')
     `),
@@ -198,7 +205,7 @@ export function createDb(dbPath: string): Database {
       return stmts.getJournalEntries.all(bookMappingId) as JournalEntry[];
     },
     upsertJournalEntry(data) {
-      stmts.upsertJournalEntry.run(data);
+      stmts.upsertJournalEntry.run({ percent: null, ...data });
     },
     setConfig(key, value) {
       stmts.setConfig.run(key, value);

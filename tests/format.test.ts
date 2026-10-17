@@ -18,6 +18,11 @@ describe('formatDayLine', () => {
     expect(formatDayLine(write('2026-10-15', 85, 716, 95))).toBe('• Oct 15 — 85 min (total 11:56, 95%)');
   });
 
+  it('shows an ebook day as the percent reached', () => {
+    expect(formatDayLine({ book: 'E', action: 'journal_write', success: true, date: '2026-10-17', percent: 12, ebook: true }))
+      .toBe('• Oct 17 — read to 12%');
+  });
+
   it('omits the percent when unknown', () => {
     expect(formatDayLine(write('2026-10-04', 21, 21, undefined))).toBe('• Oct 4 — 21 min (total 0:21)');
   });

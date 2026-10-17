@@ -12,6 +12,7 @@ services:
       - ABS_API_TOKEN=${ABS_API_TOKEN}
       - SYNC_CRON=${SYNC_CRON:-0 22 * * *}
       - SMOKE_CRON=${SMOKE_CRON:-15 4 * * 0}
+      - ABS_TIMEZONE=${ABS_TIMEZONE:-America/Indiana/Indianapolis}  # ABS server zone; ebook entries are dated in it
       - STORYGRAPH_EMAIL=${STORYGRAPH_EMAIL:-}
       - STORYGRAPH_PASSWORD=${STORYGRAPH_PASSWORD:-}
       - STORYGRAPH_USERNAME=${STORYGRAPH_USERNAME:-chrisandrews}

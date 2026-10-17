@@ -12,6 +12,17 @@ export interface AbsBookProgress {
   coverPath: string | null;
   asin: string | null;
   isbn: string | null;
+  /** True for an ebook-only item (an ebook file and no audio tracks). */
+  isEbook: boolean;
+  /** Ebook reading position, 0–100 (0 when the item has no ebook progress). */
+  ebookPercent: number;
+}
+
+/** The latest ebook reading position ABS has for an item (ABS keeps no per-day history). */
+export interface AbsEbookProgress {
+  percent: number; // 0–100
+  lastUpdate: number; // epoch ms of the last position change
+  isFinished: boolean;
 }
 
 /** A single Audiobookshelf listening session (from /api/me/listening-sessions). */
@@ -44,6 +55,7 @@ interface AbsMediaProgress {
   duration: number;
   isFinished: boolean;
   lastUpdate: number;
+  ebookProgress?: number | null;
 }
 
 interface AbsLibraryItem {
@@ -58,6 +70,8 @@ interface AbsLibraryItem {
     };
     duration: number;
     coverPath: string | null;
+    numTracks?: number;
+    ebookFormat?: string | null;
   };
 }
 
@@ -74,6 +88,20 @@ export interface AbsClient {
   getListeningSessions(libraryItemId: string): Promise<AbsListeningSession[]>;
   /** True if ABS marks this item finished (finished items drop out of items-in-progress). */
   isItemFinished(libraryItemId: string): Promise<boolean>;
+  /** The item's latest ebook position, or null if ABS has none. */
+  getEbookProgress(libraryItemId: string): Promise<AbsEbookProgress | null>;
+}
+
+/**
+ * The calendar day ('YYYY-MM-DD') of an epoch-ms timestamp in `timeZone`.
+ * Ebook entries are dated with this, in the ABS server's zone, to match the
+ * days ABS uses for listening sessions.
+ */
+export function dayInTimeZone(epochMs: number, timeZone: string): string {
+  // en-CA formats as YYYY-MM-DD.
+  return new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(
+    new Date(epochMs)
+  );
 }
 
 /**
@@ -146,18 +174,23 @@ export function createAbsClient(baseUrl: string, apiToken: string): AbsClient {
         .filter((item) => item.mediaType === 'book')
         .map((item) => {
           const progress = progressMap.get(item.id);
+          const isEbook = !item.media.numTracks && !!item.media.ebookFormat;
+          const ebookPercent = (progress?.ebookProgress ?? 0) * 100;
           return {
             absLibraryItemId: item.id,
             title: item.media.metadata.title,
             author: item.media.metadata.authorName,
             durationSeconds: item.media.duration,
-            progressPercent: progress ? progress.progress * 100 : 0,
+            // For ebooks the audio `progress` stays 0; report the reading position instead.
+            progressPercent: isEbook ? ebookPercent : progress ? progress.progress * 100 : 0,
             currentTimeSeconds: progress?.currentTime ?? 0,
             isFinished: progress?.isFinished ?? false,
             lastUpdate: progress?.lastUpdate ?? 0,
             coverPath: item.media.coverPath,
             asin: item.media.metadata.asin ?? null,
             isbn: item.media.metadata.isbn ?? null,
+            isEbook,
+            ebookPercent,
           };
         });
     },
@@ -183,6 +216,13 @@ export function createAbsClient(baseUrl: string, apiToken: string): AbsClient {
     async isItemFinished(libraryItemId: string): Promise<boolean> {
       const meRes = await apiFetch<{ mediaProgress: AbsMediaProgress[] }>('/api/me');
       return meRes.mediaProgress.some((mp) => mp.libraryItemId === libraryItemId && mp.isFinished);
+    },
+
+    async getEbookProgress(libraryItemId: string): Promise<AbsEbookProgress | null> {
+      const meRes = await apiFetch<{ mediaProgress: AbsMediaProgress[] }>('/api/me');
+      const mp = meRes.mediaProgress.find((m) => m.libraryItemId === libraryItemId);
+      if (!mp || (!mp.ebookProgress && !mp.isFinished)) return null;
+      return { percent: (mp.ebookProgress ?? 0) * 100, lastUpdate: mp.lastUpdate, isFinished: mp.isFinished };
     },
   };
 }

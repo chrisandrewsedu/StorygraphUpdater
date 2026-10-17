@@ -1,7 +1,7 @@
 import TelegramBot from 'node-telegram-bot-api';
 import { logger } from './logger.js';
 import type { Database } from './db.js';
-import { matchShelfByTitle, type StoryGraph, type StoryGraphSearchResult, type StoryGraphEdition } from './storygraph.js';
+import { isAudioFormat, isDigitalFormat, matchShelfByTitle, type StoryGraph, type StoryGraphSearchResult, type StoryGraphEdition } from './storygraph.js';
 import type { AbsClient, AbsBookProgress } from './abs-client.js';
 import { runSync, backfillMapping, linkBook, ensureLoggedIn, runSmokeCheck, type SyncResult } from './sync.js';
 import { escapeMd, formatBackfillSummary, formatDayLine, formatSmokeReport } from './format.js';
@@ -34,7 +34,18 @@ export function createBot(options: CreateBotOptions): Bot {
   const storygraphUsername = options.storygraphUsername ?? 'chrisandrews';
   const storygraphCreds = options.storygraphCreds ?? { email: '', password: '' };
 
-  const bot = new TelegramBot(token, { polling: true });
+  // Long-poll (Telegram holds each request up to 50s) and wait 2s between polls.
+  // The default 300ms retry with no backoff logged ~3 errors a second during the
+  // daily ~100s network drop.
+  const bot = new TelegramBot(token, { polling: { interval: 2000, params: { timeout: 50 } } });
+  let lastPollingErrorLog = 0;
+  bot.on('polling_error', (err: Error & { code?: string }) => {
+    const now = Date.now();
+    if (now - lastPollingErrorLog > 60_000) {
+      lastPollingErrorLog = now;
+      logger.warn(`Telegram polling error (further errors muted for 60s): ${err.code ?? ''} ${err.message}`);
+    }
+  });
 
   // ── URL cache for callback_data (Telegram limits to 64 bytes) ───────────────
   const urlCache = new Map<number, string>();
@@ -512,11 +523,16 @@ export function createBot(options: CreateBotOptions): Bot {
       const bookUrl = getCachedUrl(urlId);
       if (!bookUrl) { await reply(cid, 'Button expired. Please search again.'); return; }
 
-      await reply(cid, `Loading editions (filtering for audiobooks)...`);
+      const booksInProgress = await absClient.getItemsInProgress().catch((): AbsBookProgress[] => []);
+      const absBook = booksInProgress.find((b) => b.absLibraryItemId === absId);
+      // Ebooks are tracked on a digital edition (percent), audiobooks on an audio one (minutes).
+      const kindLabel = absBook?.isEbook ? 'ebook' : 'audiobook';
+      const isKind = absBook?.isEbook ? isDigitalFormat : isAudioFormat;
+      await reply(cid, `Loading editions (filtering for ${kindLabel}s)...`);
       try {
         const allEditions = await storygraph.getEditions(bookUrl);
-        // For /link, filter to audio editions only, prefer English
-        const audioEditions = allEditions.filter((e) => e.format === 'audio' || e.format === 'audiobook');
+        // For /link, filter to editions of the right kind only, prefer English
+        const audioEditions = allEditions.filter((e) => isKind(e.format));
         // Prioritize English editions (info containing "English" or not containing other languages)
         const englishAudio = audioEditions.filter((e) => {
           const lower = e.info.toLowerCase();
@@ -524,15 +540,12 @@ export function createBot(options: CreateBotOptions): Bot {
         });
         const filteredAudio = englishAudio.length > 0 ? englishAudio : audioEditions;
 
-        const booksInProgress = await absClient.getItemsInProgress();
-        const absBook = booksInProgress.find((b) => b.absLibraryItemId === absId);
-
         if (filteredAudio.length === 0) {
           if (allEditions.length === 0) {
             await reply(cid, `No editions found. Linking directly...`);
             await finishLink(cid, absId, absBook, bookUrl);
           } else {
-            await reply(cid, `No audiobook editions found. Showing first 3 of ${allEditions.length} editions:`);
+            await reply(cid, `No ${kindLabel} editions found. Showing first 3 of ${allEditions.length} editions:`);
             await sendEditionResults(cid, allEditions.slice(0, 3),
               (e) => `lk_ed:${absId}:${cacheUrl(e.bookUrl)}`,
               '');
@@ -543,7 +556,7 @@ export function createBot(options: CreateBotOptions): Bot {
         if (filteredAudio.length === 1) {
           const edition = filteredAudio[0];
           const editionUrl = edition.bookUrl || bookUrl;
-          await reply(cid, `Found one audiobook edition — auto-linking.\n${edition.info}`);
+          await reply(cid, `Found one ${kindLabel} edition — auto-linking.\n${edition.info}`);
           await finishLink(cid, absId, absBook, editionUrl);
           return;
         }
@@ -553,7 +566,7 @@ export function createBot(options: CreateBotOptions): Bot {
         const first = filteredAudio.slice(0, PAGE_SIZE);
         await sendEditionResults(cid, first,
           (e) => `lk_ed:${absId}:${cacheUrl(e.bookUrl)}`,
-          `Found ${filteredAudio.length} audiobook editions (showing first ${Math.min(PAGE_SIZE, filteredAudio.length)}):`);
+          `Found ${filteredAudio.length} ${kindLabel} editions (showing first ${Math.min(PAGE_SIZE, filteredAudio.length)}):`);
 
         if (filteredAudio.length > PAGE_SIZE) {
           // Cache the remaining editions for "show more"
@@ -564,7 +577,7 @@ export function createBot(options: CreateBotOptions): Bot {
               bookUrl: e.bookUrl,
             })),
           }));
-          await reply(cid, `${filteredAudio.length - PAGE_SIZE} more audiobook editions available.`, {
+          await reply(cid, `${filteredAudio.length - PAGE_SIZE} more ${kindLabel} editions available.`, {
             reply_markup: {
               inline_keyboard: [[{ text: 'Show more editions', callback_data: `lk_more:${remainingId}` }]],
             },
@@ -1051,7 +1064,7 @@ export function createBot(options: CreateBotOptions): Bot {
         return;
       }
 
-      await reply(chatId, `New audiobook detected: *${book.title}* by ${book.author}\nProgress: ${book.progressPercent.toFixed(1)}%\n\nWhich StoryGraph entry matches? Selecting will link it and mark as currently reading.`);
+      await reply(chatId, `New ${book.isEbook ? 'ebook' : 'audiobook'} detected: *${book.title}* by ${book.author}\nProgress: ${book.progressPercent.toFixed(1)}%\n\nWhich StoryGraph entry matches? Selecting will link it and mark as currently reading.`);
 
       await sendSearchResults(chatId, top3,
         (r) => `lk_bk:${book.absLibraryItemId}:${cacheUrl(r.bookUrl)}`,
@@ -1148,7 +1161,7 @@ export function createBot(options: CreateBotOptions): Bot {
       if ((r.action === 'journal_write' || r.action === 'journal_fix') && r.success) {
         if (!shownBooks.has(r.book)) {
           shownBooks.add(r.book);
-          lines.push(`✅ *${escapeMd(r.book)}* — listening days written:`);
+          lines.push(`✅ *${escapeMd(r.book)}* — ${r.ebook ? 'reading' : 'listening'} days written:`);
         }
         lines.push(formatDayLine(r));
         continue;
