@@ -1,8 +1,11 @@
 import { logger } from './logger.js';
-import { reduceSessionsToDailyProgress } from './abs-client.js';
+import { dayInTimeZone, reduceSessionsToDailyProgress } from './abs-client.js';
 import type { AbsBookProgress, AbsClient, AbsDayProgress } from './abs-client.js';
 import type { Database, BookMapping } from './db.js';
-import { bookIdFromUrl, chooseAudioEdition, type StoryGraph } from './storygraph.js';
+import { bookIdFromUrl, chooseEdition, isAudioFormat, isDigitalFormat, type EditionKind, type StoryGraph } from './storygraph.js';
+
+/** Zone of the ABS server, used to date ebook entries the way ABS dates listening days. */
+const ABS_TIMEZONE = process.env.ABS_TIMEZONE || 'UTC';
 
 /** Minutes tolerance before an ABS↔StoryGraph day is treated as a mismatch (absorbs rounding). */
 const MISMATCH_TOLERANCE_MIN = 1;
@@ -126,6 +129,8 @@ export interface SyncResult {
   date?: string;
   dayMinutes?: number;
   totalMinutes?: number;
+  /** True for an ebook entry (percent only, no minutes). */
+  ebook?: boolean;
   error?: string;
   screenshotPath?: string;
 }
@@ -251,6 +256,105 @@ export async function reconcileBook(
   return results;
 }
 
+/** The ebook position to record: the day ABS last saw it change, and the percent. */
+export interface EbookSnapshot {
+  date: string; // 'YYYY-MM-DD'
+  percent: number; // 0–100, unrounded
+}
+
+export type EbookPlan =
+  | { type: 'none' }
+  | { type: 'write'; date: string; percent: number; replace: boolean };
+
+/**
+ * Decide whether tonight's ebook snapshot needs a journal entry. ABS keeps only
+ * the latest position, so each sync records at most one entry: write when the
+ * whole-number percent moved past everything recorded so far; if a day already
+ * has an entry (read more later the same day), replace it. Pure.
+ */
+export function planEbookEntry(
+  snapshot: EbookSnapshot | null,
+  localWritten: { date: string; percent: number | null }[]
+): EbookPlan {
+  if (!snapshot) return { type: 'none' };
+  // Floor so we never claim more than was read (1.5% → 1%).
+  const percent = Math.min(100, Math.floor(snapshot.percent));
+  if (percent <= 0) return { type: 'none' };
+  const best = Math.max(0, ...localWritten.map((e) => e.percent ?? 0));
+  if (percent <= best) return { type: 'none' };
+  const replace = localWritten.some((e) => e.date === snapshot.date);
+  return { type: 'write', date: snapshot.date, percent, replace };
+}
+
+/**
+ * Sync one linked ebook: write tonight's reading position as a dated percent
+ * entry on its digital edition, and mark it read when ABS says it's finished.
+ */
+export async function reconcileEbook(
+  storygraph: StoryGraph,
+  db: Database,
+  mapping: BookMapping,
+  snapshot: EbookSnapshot | null,
+  isFinished: boolean
+): Promise<SyncResult[]> {
+  const results: SyncResult[] = [];
+  const url = mapping.storygraphBookUrl;
+  const localWritten = db
+    .getJournalEntries(mapping.id)
+    .filter((e) => e.status === 'success')
+    .map((e) => ({ date: e.entryDate, percent: e.percent }));
+  const plan = planEbookEntry(snapshot, localWritten);
+
+  if (plan.type === 'write') {
+    try {
+      await storygraph.markAsReading(url);
+      // First entry: StoryGraph dated "Started reading" on the day it was shelved.
+      if (localWritten.length === 0) {
+        await storygraph
+          .setStartDate(url, plan.date)
+          .catch((e) => logger.warn(`setStartDate(${plan.date}) failed: ${e instanceof Error ? e.message : String(e)}`));
+      }
+      if (plan.replace) {
+        const existing = (await storygraph.getJournalEntries(url)).find(
+          (e) => e.date === plan.date && e.percent != null && e.entryId
+        );
+        if (existing?.entryId) await storygraph.deleteJournalEntry(existing.entryId);
+      }
+      await storygraph.addPercentProgress(url, plan.date, plan.percent);
+      db.upsertJournalEntry({ bookMappingId: mapping.id, entryDate: plan.date, minutes: 0, percent: plan.percent, status: 'success' });
+      results.push({
+        book: mapping.title,
+        action: plan.replace ? 'journal_fix' : 'journal_write',
+        success: true,
+        date: plan.date,
+        percent: plan.percent,
+        ebook: true,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // Don't record a failed day locally: it would count as written and block the retry.
+      results.push({ book: mapping.title, action: 'journal_write', success: false, error: `${plan.date}: ${msg}` });
+    }
+  }
+
+  if (isFinished) {
+    try {
+      await storygraph.markAsRead(url);
+      results.push({ book: mapping.title, action: 'mark_read', success: true });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      results.push({ book: mapping.title, action: 'mark_read', success: false, error: msg });
+    }
+  }
+
+  return results;
+}
+
+/** Tonight's ebook snapshot from ABS's latest position and its change time. */
+function ebookSnapshot(percent: number, lastUpdate: number): EbookSnapshot | null {
+  return lastUpdate > 0 ? { date: dayInTimeZone(lastUpdate, ABS_TIMEZONE), percent } : null;
+}
+
 /**
  * If the user's shelf now holds a different edition than the mapping, point the
  * mapping at it — but only if it is an audio edition (print editions drop minutes).
@@ -265,7 +369,7 @@ async function followShelvedEdition(
   if (!shelvedId || shelvedId === bookIdFromUrl(mapping.storygraphBookUrl)) return null;
   const newUrl = `https://app.thestorygraph.com/books/${shelvedId}`;
   const format = (await storygraph.getEditionFormat(newUrl).catch(() => null)) ?? 'unknown';
-  if (format !== 'audio' && format !== 'audiobook') {
+  if (!isAudioFormat(format)) {
     logger.warn(`${mapping.title}: shelf moved to a ${format} edition (${newUrl}); not syncing`);
     return {
       url: newUrl,
@@ -305,7 +409,9 @@ export async function runSmokeCheck(
   storygraph: StoryGraph,
   db: Database
 ): Promise<{ checked: string | null; problems: string[] }> {
+  // Audio mappings only: the checks below expect audio editions and minutes.
   const mapping = [...db.getAllBookMappings()]
+    .filter((m) => m.editionType !== 'digital')
     .sort((a, b) => b.id - a.id)
     .find((m) => db.getJournalEntries(m.id).some((e) => e.status === 'success'));
   if (!mapping) return { checked: null, problems: [] };
@@ -324,7 +430,7 @@ export async function runSmokeCheck(
   );
   await check('editions', async () => {
     const editions = await storygraph.getEditions(mapping.storygraphBookUrl);
-    return editions.some((e) => e.format === 'audio' || e.format === 'audiobook')
+    return editions.some((e) => isAudioFormat(e.format))
       ? null
       : `editions page parsed ${editions.length} editions and no audio edition`;
   });
@@ -339,8 +445,9 @@ export async function runSmokeCheck(
 /**
  * Link an ABS book to StoryGraph. Journal minutes only stick on an AUDIO edition
  * (a print edition records "0 pages"), and entries follow whichever edition is
- * shelved — so resolve to the matching audio edition, switch the shelf to it,
- * save the mapping and mark it currently reading. Returns the saved mapping.
+ * shelved — so resolve to the matching audio edition (a DIGITAL edition for an
+ * ABS ebook), switch the shelf to it, save the mapping and mark it currently
+ * reading. Returns the saved mapping.
  */
 export async function linkBook(
   db: Database,
@@ -349,25 +456,27 @@ export async function linkBook(
   absBook: AbsBookProgress | undefined,
   storygraphBookUrl: string
 ): Promise<BookMapping> {
+  const kind: EditionKind = absBook?.isEbook ? 'digital' : 'audio';
+  const isKind = kind === 'audio' ? isAudioFormat : isDigitalFormat;
   try {
     // Exact match by ASIN/ISBN via StoryGraph's edition search; else scan the editions list.
-    let audioUrl: string | null = null;
+    let editionUrl: string | null = null;
     for (const id of [absBook?.asin, absBook?.isbn]) {
-      if (!id || audioUrl) continue;
+      if (!id || editionUrl) continue;
       const match = await storygraph.findEditionByIdentifier(storygraphBookUrl, id).catch(() => null);
-      if (match && (match.format === 'audio' || match.format === 'audiobook')) audioUrl = match.bookUrl;
+      if (match && isKind(match.format)) editionUrl = match.bookUrl;
     }
-    if (!audioUrl) {
+    if (!editionUrl) {
       const editions = await storygraph.getEditions(storygraphBookUrl);
-      audioUrl = chooseAudioEdition(editions, storygraphBookUrl, { asin: absBook?.asin, isbn: absBook?.isbn });
+      editionUrl = chooseEdition(editions, storygraphBookUrl, { asin: absBook?.asin, isbn: absBook?.isbn }, kind);
     }
-    if (audioUrl !== storygraphBookUrl) {
-      logger.info(`linkBook: using audio edition ${audioUrl} instead of ${storygraphBookUrl}`);
-      storygraphBookUrl = audioUrl;
+    if (editionUrl !== storygraphBookUrl) {
+      logger.info(`linkBook: using ${kind} edition ${editionUrl} instead of ${storygraphBookUrl}`);
+      storygraphBookUrl = editionUrl;
     }
     await storygraph.switchToEdition(storygraphBookUrl);
   } catch (e) {
-    logger.warn(`audio edition resolve/switch failed: ${e instanceof Error ? e.message : String(e)}`);
+    logger.warn(`${kind} edition resolve/switch failed: ${e instanceof Error ? e.message : String(e)}`);
   }
 
   db.upsertBookMapping({
@@ -375,7 +484,7 @@ export async function linkBook(
     storygraphBookUrl,
     title: absBook?.title ?? absId,
     author: absBook?.author ?? '',
-    editionType: 'audio',
+    editionType: kind,
     asin: absBook?.asin ?? null,
     isbn: absBook?.isbn ?? null,
   });
@@ -386,8 +495,9 @@ export async function linkBook(
 }
 
 /**
- * Reconcile a single mapping from ABS's full session history. Used both for the
- * one-time backfill after linking and as the per-book step of the nightly run.
+ * Reconcile a single mapping from ABS's full session history (or, for an ebook,
+ * its latest reading position). Used for the one-time backfill after linking,
+ * /backfill, and books that finished in ABS.
  */
 export async function backfillMapping(
   absClient: AbsClient,
@@ -397,6 +507,12 @@ export async function backfillMapping(
   isFinished: boolean,
   now: Date = new Date()
 ): Promise<SyncResult[]> {
+  if (mapping.editionType === 'digital') {
+    const progress = await absClient.getEbookProgress(mapping.absLibraryItemId);
+    const snapshot = progress ? ebookSnapshot(progress.percent, progress.lastUpdate) : null;
+    logger.info(`backfillMapping ${mapping.title}: ebook at ${progress?.percent.toFixed(1) ?? 'no'}%`);
+    return reconcileEbook(storygraph, db, mapping, snapshot, isFinished || (progress?.isFinished ?? false));
+  }
   const sessions = await absClient.getListeningSessions(mapping.absLibraryItemId);
   const daily = reduceSessionsToDailyProgress(sessions);
   logger.info(`backfillMapping ${mapping.title}: ${daily.length} listening days from ABS`);
@@ -432,9 +548,15 @@ export async function runSync(
     }
 
     try {
-      const sessions = await absClient.getListeningSessions(book.absLibraryItemId);
-      const daily = reduceSessionsToDailyProgress(sessions);
-      const bookResults = await reconcileBook(storygraph, db, mapping, daily, book.isFinished, now);
+      let bookResults: SyncResult[];
+      if (mapping.editionType === 'digital') {
+        const snapshot = ebookSnapshot(book.ebookPercent, book.lastUpdate);
+        bookResults = await reconcileEbook(storygraph, db, mapping, snapshot, book.isFinished);
+      } else {
+        const sessions = await absClient.getListeningSessions(book.absLibraryItemId);
+        const daily = reduceSessionsToDailyProgress(sessions);
+        bookResults = await reconcileBook(storygraph, db, mapping, daily, book.isFinished, now);
+      }
       results.push(...bookResults);
 
       // Record a sync_log row so Pass 2 (disappeared-book detection) still has the

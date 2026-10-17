@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { determineSyncActions, diffDailyProgress, reconcileBook, runSync, ensureLoggedIn, runSmokeCheck, linkBook, type SyncAction } from '../src/sync.js';
+import { determineSyncActions, diffDailyProgress, reconcileBook, runSync, ensureLoggedIn, runSmokeCheck, linkBook, planEbookEntry, reconcileEbook, type SyncAction } from '../src/sync.js';
 import { createDb, type Database } from '../src/db.js';
 import type { AbsClient, AbsDayProgress, AbsListeningSession } from '../src/abs-client.js';
 import type { StoryGraph, StoryGraphJournalEntry } from '../src/storygraph.js';
@@ -503,5 +503,161 @@ describe('linkBook', () => {
     };
     const m = await linkBook(db, sg as StoryGraph, 'li_l', absBook, PRINT);
     expect(m.storygraphBookUrl).toBe(AUDIO);
+  });
+});
+
+describe('planEbookEntry', () => {
+  it('writes the floored percent when it moved past everything recorded', () => {
+    expect(planEbookEntry({ date: '2026-10-17', percent: 1.53 }, [])).toEqual({ type: 'write', date: '2026-10-17', percent: 1, replace: false });
+    expect(planEbookEntry({ date: '2026-10-18', percent: 9.9 }, [{ date: '2026-10-17', percent: 1 }]))
+      .toEqual({ type: 'write', date: '2026-10-18', percent: 9, replace: false });
+  });
+
+  it('skips below 1% and when there is no forward progress', () => {
+    expect(planEbookEntry({ date: '2026-10-17', percent: 0.6 }, [])).toEqual({ type: 'none' });
+    expect(planEbookEntry({ date: '2026-10-18', percent: 9.2 }, [{ date: '2026-10-17', percent: 9 }])).toEqual({ type: 'none' });
+    expect(planEbookEntry({ date: '2026-10-18', percent: 5 }, [{ date: '2026-10-17', percent: 9 }])).toEqual({ type: 'none' });
+    expect(planEbookEntry(null, [])).toEqual({ type: 'none' });
+  });
+
+  it('replaces the day when more was read later the same day', () => {
+    expect(planEbookEntry({ date: '2026-10-17', percent: 4 }, [{ date: '2026-10-17', percent: 2 }]))
+      .toEqual({ type: 'write', date: '2026-10-17', percent: 4, replace: true });
+  });
+});
+
+describe('reconcileEbook', () => {
+  const DIR = path.resolve('./data/test');
+  const DB_PATH = path.join(DIR, 'ebook.db');
+  const URL = 'https://app.thestorygraph.com/books/dddd0000-0000-0000-0000-000000000000';
+  let db: Database;
+  beforeEach(() => {
+    fs.mkdirSync(DIR, { recursive: true }); fs.rmSync(DB_PATH, { force: true }); db = createDb(DB_PATH);
+    db.upsertBookMapping({ absLibraryItemId: 'li_eb', storygraphBookUrl: URL, title: 'Ethical Machines', author: 'R', editionType: 'digital' });
+  });
+  afterEach(() => { db.close(); fs.rmSync(DB_PATH, { force: true }); });
+  const mapping = () => db.getBookMappingByAbsId('li_eb')!;
+
+  function fakeEbookSg(journal: StoryGraphJournalEntry[] = [], failWrite = false) {
+    const calls: any = { markAsReading: 0, setStartDate: [], percent: [], deleted: [], markAsRead: 0 };
+    const sg: Partial<StoryGraph> = {
+      async markAsReading() { calls.markAsReading++; },
+      async setStartDate(_u, d) { calls.setStartDate.push(d); },
+      async getJournalEntries() { return journal; },
+      async deleteJournalEntry(id) { calls.deleted.push(id); },
+      async addPercentProgress(_u, date, pct) { if (failWrite) throw new Error('boom'); calls.percent.push([date, pct]); },
+      async markAsRead() { calls.markAsRead++; },
+    };
+    return { sg: sg as StoryGraph, calls };
+  }
+
+  it('writes the first entry, moves the start date, and records it locally', async () => {
+    const { sg, calls } = fakeEbookSg();
+    const results = await reconcileEbook(sg, db, mapping(), { date: '2026-10-17', percent: 1.53 }, false);
+    expect(calls.percent).toEqual([['2026-10-17', 1]]);
+    expect(calls.markAsReading).toBe(1);
+    expect(calls.setStartDate).toEqual(['2026-10-17']);
+    expect(results).toEqual([{ book: 'Ethical Machines', action: 'journal_write', success: true, date: '2026-10-17', percent: 1, ebook: true }]);
+    expect(db.getJournalEntries(mapping().id).map((e) => [e.entryDate, e.percent])).toEqual([['2026-10-17', 1]]);
+  });
+
+  it('is idempotent and leaves the start date alone later', async () => {
+    await reconcileEbook(fakeEbookSg().sg, db, mapping(), { date: '2026-10-17', percent: 1.5 }, false);
+    const again = fakeEbookSg();
+    await reconcileEbook(again.sg, db, mapping(), { date: '2026-10-17', percent: 1.5 }, false);
+    expect(again.calls.percent).toEqual([]);
+    const next = fakeEbookSg();
+    await reconcileEbook(next.sg, db, mapping(), { date: '2026-10-18', percent: 6 }, false);
+    expect(next.calls.percent).toEqual([['2026-10-18', 6]]);
+    expect(next.calls.setStartDate).toEqual([]);
+  });
+
+  it('replaces the same-day entry on StoryGraph when more was read that day', async () => {
+    await reconcileEbook(fakeEbookSg().sg, db, mapping(), { date: '2026-10-17', percent: 2 }, false);
+    const { sg, calls } = fakeEbookSg([
+      { entryId: 'START', date: '2026-10-17', minutes: null, percent: null },
+      { entryId: 'E1', date: '2026-10-17', minutes: null, percent: 2 },
+    ]);
+    const results = await reconcileEbook(sg, db, mapping(), { date: '2026-10-17', percent: 5 }, false);
+    expect(calls.deleted).toEqual(['E1']);
+    expect(calls.percent).toEqual([['2026-10-17', 5]]);
+    expect(results[0]).toMatchObject({ action: 'journal_fix', percent: 5 });
+  });
+
+  it('does not record a failed write, so the next sync retries it', async () => {
+    const results = await reconcileEbook(fakeEbookSg([], true).sg, db, mapping(), { date: '2026-10-17', percent: 3 }, false);
+    expect(results[0]).toMatchObject({ success: false });
+    expect(db.getJournalEntries(mapping().id)).toEqual([]);
+  });
+
+  it('marks the book read when ABS says it is finished', async () => {
+    const { sg, calls } = fakeEbookSg();
+    await reconcileEbook(sg, db, mapping(), { date: '2026-10-20', percent: 100 }, true);
+    expect(calls.percent).toEqual([['2026-10-20', 100]]);
+    expect(calls.markAsRead).toBe(1);
+  });
+});
+
+describe('runSync — ebook mapping', () => {
+  const DIR = path.resolve('./data/test');
+  const DB_PATH = path.join(DIR, 'runsync-ebook.db');
+  let db: Database;
+  beforeEach(() => {
+    fs.mkdirSync(DIR, { recursive: true }); fs.rmSync(DB_PATH, { force: true }); db = createDb(DB_PATH);
+    db.upsertBookMapping({ absLibraryItemId: 'li_eb', storygraphBookUrl: 'https://app.thestorygraph.com/books/eb', title: 'Ethical Machines', author: 'R', editionType: 'digital' });
+  });
+  afterEach(() => { db.close(); fs.rmSync(DB_PATH, { force: true }); });
+
+  it('writes the ebook position instead of reading listening sessions', async () => {
+    let sessionsRead = 0;
+    const abs: AbsClient = {
+      async getItemsInProgress() {
+        return [{ absLibraryItemId: 'li_eb', title: 'Ethical Machines', author: 'R', durationSeconds: 0, progressPercent: 12.4,
+          currentTimeSeconds: 0, isFinished: false, lastUpdate: Date.parse('2026-10-17T16:26:05Z'), coverPath: null,
+          asin: null, isbn: null, isEbook: true, ebookPercent: 12.4 }];
+      },
+      async getListeningSessions() { sessionsRead++; return []; },
+      async isItemFinished() { return false; },
+      async getEbookProgress() { return null; },
+    };
+    const percent: any[] = [];
+    const sg = { async markAsReading() {}, async setStartDate() {}, async addPercentProgress(_u: string, d: string, p: number) { percent.push([d, p]); } } as unknown as StoryGraph;
+    await runSync(abs, db, sg, () => {}, () => {});
+    expect(sessionsRead).toBe(0);
+    expect(percent).toEqual([['2026-10-17', 12]]); // ABS_TIMEZONE unset in tests → UTC day
+    expect(db.getLastSync(db.getBookMappingByAbsId('li_eb')!.id)).toMatchObject({ progressPercent: 12.4, status: 'success' });
+  });
+});
+
+describe('linkBook — ebook', () => {
+  const DIR = path.resolve('./data/test');
+  const DB_PATH = path.join(DIR, 'link-ebook.db');
+  const PRINT = 'https://app.thestorygraph.com/books/aaaa0000-0000-0000-0000-000000000000';
+  const AUDIO = 'https://app.thestorygraph.com/books/bbbb0000-0000-0000-0000-000000000000';
+  const DIGITAL = 'https://app.thestorygraph.com/books/cccc0000-0000-0000-0000-000000000000';
+  let db: Database;
+  beforeEach(() => { fs.mkdirSync(DIR, { recursive: true }); fs.rmSync(DB_PATH, { force: true }); db = createDb(DB_PATH); });
+  afterEach(() => { db.close(); fs.rmSync(DB_PATH, { force: true }); });
+
+  it('links an ABS ebook to the digital edition and saves it as digital', async () => {
+    const switched: string[] = [];
+    const sg: Partial<StoryGraph> = {
+      async findEditionByIdentifier() { return null; },
+      async getEditions() {
+        return [
+          { title: 'EM', format: 'hardcover', info: '', bookUrl: PRINT, coverUrl: '', isbn: '9781647822811' },
+          { title: 'EM', format: 'audio', info: '', bookUrl: AUDIO, coverUrl: '', isbn: '9798212281089' },
+          { title: 'EM', format: 'digital', info: '', bookUrl: DIGITAL, coverUrl: '', isbn: null },
+        ];
+      },
+      async switchToEdition(url) { switched.push(url); },
+      async markAsReading() {},
+    };
+    const absBook = { absLibraryItemId: 'li_eb', title: 'Ethical Machines', author: 'R', durationSeconds: 0, progressPercent: 1.5,
+      currentTimeSeconds: 0, isFinished: false, lastUpdate: 0, coverPath: null, asin: null, isbn: null, isEbook: true, ebookPercent: 1.5 };
+    const m = await linkBook(db, sg as StoryGraph, 'li_eb', absBook, PRINT);
+    expect(m.storygraphBookUrl).toBe(DIGITAL);
+    expect(m.editionType).toBe('digital');
+    expect(switched).toEqual([DIGITAL]);
   });
 });

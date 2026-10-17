@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
+  dayInTimeZone,
   createAbsClient,
   reduceSessionsToDailyProgress,
   type AbsBookProgress,
@@ -235,5 +236,58 @@ describe('reduceSessionsToDailyProgress', () => {
     ]);
     expect(daily.map((d) => d.date)).toEqual(['2026-05-01', '2026-05-03']);
     expect(daily.map((d) => d.cumulativeMinutes)).toEqual([60, 80]);
+  });
+});
+
+describe('ebook items', () => {
+  const mockFetch2 = vi.fn();
+  beforeEach(() => { vi.stubGlobal('fetch', mockFetch2); mockFetch2.mockReset(); });
+
+  it('reports an ebook-only item with its reading position as the progress', async () => {
+    const client = createAbsClient('http://abs.local:13378', 't');
+    mockFetch2.mockResolvedValueOnce({ ok: true, json: async () => ({ libraryItems: [{
+      id: 'li_eb', mediaType: 'book',
+      media: { metadata: { title: 'Ethical Machines', authorName: 'Reid Blackman' }, duration: 0, coverPath: null, numTracks: 0, ebookFormat: 'epub' },
+    }] }) });
+    mockFetch2.mockResolvedValueOnce({ ok: true, json: async () => ({ mediaProgress: [
+      { libraryItemId: 'li_eb', progress: 0, currentTime: 0, duration: 0, isFinished: false, lastUpdate: 1792254365510, ebookProgress: 0.0153 },
+    ] }) });
+    const [item] = await client.getItemsInProgress();
+    expect(item.isEbook).toBe(true);
+    expect(item.ebookPercent).toBeCloseTo(1.53, 2);
+    expect(item.progressPercent).toBeCloseTo(1.53, 2);
+  });
+
+  it('treats an item with audio tracks as an audiobook even if it also has an ebook', async () => {
+    const client = createAbsClient('http://abs.local:13378', 't');
+    mockFetch2.mockResolvedValueOnce({ ok: true, json: async () => ({ libraryItems: [{
+      id: 'li_both', mediaType: 'book',
+      media: { metadata: { title: 'Both', authorName: 'A' }, duration: 100, coverPath: null, numTracks: 3, ebookFormat: 'epub' },
+    }] }) });
+    mockFetch2.mockResolvedValueOnce({ ok: true, json: async () => ({ mediaProgress: [
+      { libraryItemId: 'li_both', progress: 0.5, currentTime: 50, duration: 100, isFinished: false, lastUpdate: 1, ebookProgress: 0.1 },
+    ] }) });
+    const [item] = await client.getItemsInProgress();
+    expect(item.isEbook).toBe(false);
+    expect(item.progressPercent).toBeCloseTo(50, 0);
+  });
+
+  it('getEbookProgress returns the latest position, or null without one', async () => {
+    const client = createAbsClient('http://abs.local:13378', 't');
+    const me = { ok: true, json: async () => ({ mediaProgress: [
+      { libraryItemId: 'li_eb', progress: 0, currentTime: 0, duration: 0, isFinished: false, lastUpdate: 42, ebookProgress: 0.25 },
+    ] }) };
+    mockFetch2.mockResolvedValueOnce(me);
+    expect(await client.getEbookProgress('li_eb')).toEqual({ percent: 25, lastUpdate: 42, isFinished: false });
+    mockFetch2.mockResolvedValueOnce(me);
+    expect(await client.getEbookProgress('li_other')).toBeNull();
+  });
+});
+
+describe('dayInTimeZone', () => {
+  it('dates a timestamp in the given zone, not UTC', () => {
+    const t = Date.parse('2026-10-18T02:30:00Z'); // 22:30 on the 17th in Indiana (EDT)
+    expect(dayInTimeZone(t, 'America/Indiana/Indianapolis')).toBe('2026-10-17');
+    expect(dayInTimeZone(t, 'UTC')).toBe('2026-10-18');
   });
 });

@@ -12,10 +12,11 @@ const MAX_DAY_LINES = 60; // keeps a long backfill well under Telegram's 4096-ch
 export function formatDayLine(r: SyncResult): string {
   const [, m, d] = (r.date ?? '').split('-').map((n) => parseInt(n, 10));
   const day = r.date ? `${MONTHS[m - 1]} ${d}` : '?';
+  const fixed = r.action === 'journal_fix' ? ' — corrected' : '';
+  if (r.ebook) return `• ${day} — read to ${Math.round(r.percent ?? 0)}%${fixed}`;
   const total = r.totalMinutes ?? 0;
   const totalStr = `${Math.floor(total / 60)}:${String(total % 60).padStart(2, '0')}`;
   const pct = r.percent != null ? `, ${Math.round(r.percent)}%` : '';
-  const fixed = r.action === 'journal_fix' ? ' — corrected' : '';
   return `• ${day} — ${r.dayMinutes ?? 0} min (total ${totalStr}${pct})${fixed}`;
 }
 
