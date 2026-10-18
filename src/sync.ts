@@ -2,7 +2,7 @@ import { logger } from './logger.js';
 import { dayInTimeZone, reduceSessionsToDailyProgress } from './abs-client.js';
 import type { AbsBookProgress, AbsClient, AbsDayProgress } from './abs-client.js';
 import type { Database, BookMapping } from './db.js';
-import { bookIdFromUrl, chooseEdition, isAudioFormat, isDigitalFormat, type EditionKind, type StoryGraph } from './storygraph.js';
+import { bookIdFromUrl, pickEdition, isAudioFormat, isDigitalFormat, type EditionKind, type EditionPickReason, type StoryGraph } from './storygraph.js';
 
 /** Zone of the ABS server, used to date ebook entries the way ABS dates listening days. */
 const ABS_TIMEZONE = process.env.ABS_TIMEZONE || 'UTC';
@@ -455,8 +455,9 @@ export async function linkBook(
   absId: string,
   absBook: AbsBookProgress | undefined,
   storygraphBookUrl: string
-): Promise<BookMapping> {
+): Promise<BookMapping & { matchReason: EditionPickReason }> {
   const kind: EditionKind = absBook?.isEbook ? 'digital' : 'audio';
+  let matchReason: EditionPickReason = 'none';
   const isKind = kind === 'audio' ? isAudioFormat : isDigitalFormat;
   try {
     // Exact match by ASIN/ISBN via StoryGraph's edition search; else scan the editions list.
@@ -464,11 +465,23 @@ export async function linkBook(
     for (const id of [absBook?.asin, absBook?.isbn]) {
       if (!id || editionUrl) continue;
       const match = await storygraph.findEditionByIdentifier(storygraphBookUrl, id).catch(() => null);
-      if (match && isKind(match.format)) editionUrl = match.bookUrl;
+      if (match && isKind(match.format)) {
+        editionUrl = match.bookUrl;
+        matchReason = 'id';
+      }
     }
     if (!editionUrl) {
+      // Then the editions list: IDs again, an explicit pick, an unambiguous length match.
       const editions = await storygraph.getEditions(storygraphBookUrl);
-      editionUrl = chooseEdition(editions, storygraphBookUrl, { asin: absBook?.asin, isbn: absBook?.isbn }, kind);
+      const pick = pickEdition(editions, storygraphBookUrl, {
+        asin: absBook?.asin,
+        isbn: absBook?.isbn,
+        kind,
+        absMinutes: absBook?.durationSeconds ? absBook.durationSeconds / 60 : null,
+        language: absBook?.language,
+      });
+      editionUrl = pick.url;
+      matchReason = pick.reason;
     }
     if (editionUrl !== storygraphBookUrl) {
       logger.info(`linkBook: using ${kind} edition ${editionUrl} instead of ${storygraphBookUrl}`);
@@ -491,7 +504,7 @@ export async function linkBook(
   await storygraph
     .markAsReading(storygraphBookUrl)
     .catch((e) => logger.warn(`markAsReading failed: ${e instanceof Error ? e.message : String(e)}`));
-  return db.getBookMappingByAbsId(absId)!;
+  return { ...db.getBookMappingByAbsId(absId)!, matchReason };
 }
 
 /**

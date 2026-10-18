@@ -51,3 +51,27 @@ export function formatSmokeReport(report: { checked: string | null; problems: st
     ...report.problems.map((p) => `• ${escapeMd(p)}`),
   ].join('\n') + login;
 }
+
+/** Minutes as "3h 21m" (or "45m"). */
+export function formatLength(minutes: number): string {
+  const m = Math.round(minutes);
+  return m >= 60 ? `${Math.floor(m / 60)}h ${m % 60}m` : `${m}m`;
+}
+
+/** An edition's length compared with the ABS audiobook, for the edition picker. */
+export function formatLengthDiff(editionMinutes: number, absMinutes: number): string {
+  const diff = Math.round(editionMinutes - absMinutes);
+  if (Math.abs(diff) <= 2) return 'same length as yours';
+  return `${Math.abs(diff)} min ${diff > 0 ? 'longer' : 'shorter'} than yours`;
+}
+
+/** Why /link chose an edition, so a wrong pick is easy to spot in Telegram. */
+export function formatMatchReason(reason: string, absMinutes?: number | null): string {
+  switch (reason) {
+    case 'id': return 'matched by ISBN/ASIN';
+    case 'duration': return `matched by length${absMinutes ? ` (${formatLength(absMinutes)})` : ''}`;
+    case 'chosen': return 'the edition you picked';
+    case 'only': return 'the only matching edition';
+    default: return '⚠️ no confident edition match — please check it';
+  }
+}

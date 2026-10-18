@@ -489,6 +489,24 @@ describe('linkBook', () => {
     expect(calls.switched).toEqual([AUDIO]);
   });
 
+  it('matches by audiobook length when StoryGraph lists none of the IDs, and says so', async () => {
+    const sg: Partial<StoryGraph> = {
+      async findEditionByIdentifier() { return null; },
+      async getEditions() {
+        return [
+          { title: 'Big Book', format: 'hardcover', info: '300 pages • hardcover • 2018', bookUrl: PRINT, coverUrl: '', isbn: '1' },
+          { title: 'Big Book', format: 'audio', info: '2h 45m • audio • 2018\nLanguage: English', bookUrl: 'https://app.thestorygraph.com/books/cccc0000-0000-0000-0000-000000000000', coverUrl: '', isbn: '2' },
+          { title: 'Big Book', format: 'audio', info: '3h 21m • audio • 2018\nLanguage: English', bookUrl: AUDIO, coverUrl: '', isbn: '3' },
+        ];
+      },
+      async switchToEdition() {},
+      async markAsReading() {},
+    };
+    const m = await linkBook(db, sg as StoryGraph, 'li_l', { ...absBook, durationSeconds: 12074 }, PRINT);
+    expect(m.storygraphBookUrl).toBe(AUDIO);
+    expect(m.matchReason).toBe('duration');
+  });
+
   it('falls back to scanning the editions list when the ISBN search finds no audio edition', async () => {
     const sg: Partial<StoryGraph> = {
       async findEditionByIdentifier() { return null; },

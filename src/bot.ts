@@ -1,10 +1,10 @@
 import TelegramBot from 'node-telegram-bot-api';
 import { logger } from './logger.js';
 import type { Database } from './db.js';
-import { isAudioFormat, isDigitalFormat, matchShelfByTitle, type StoryGraph, type StoryGraphSearchResult, type StoryGraphEdition } from './storygraph.js';
+import { isAudioFormat, isDigitalFormat, matchShelfByTitle, parseDurationMinutes, pickEdition, sortByDurationMatch, type StoryGraph, type StoryGraphSearchResult, type StoryGraphEdition } from './storygraph.js';
 import type { AbsClient, AbsBookProgress } from './abs-client.js';
 import { runSync, backfillMapping, linkBook, ensureLoggedIn, runSmokeCheck, type SyncResult } from './sync.js';
-import { escapeMd, formatBackfillSummary, formatDayLine, formatSmokeReport } from './format.js';
+import { escapeMd, formatBackfillSummary, formatDayLine, formatSmokeReport, formatLength, formatLengthDiff, formatMatchReason } from './format.js';
 
 export interface Bot {
   start(): void;
@@ -139,14 +139,17 @@ export function createBot(options: CreateBotOptions): Bot {
     chatIdTarget: string | number,
     editions: StoryGraphEdition[],
     makeCallbackData: (e: StoryGraphEdition) => string,
-    headerText: string
+    headerText: string,
+    absMinutes?: number | null
   ): Promise<void> {
     if (headerText) await reply(chatIdTarget, headerText);
 
     for (let i = 0; i < editions.length; i++) {
       const e = editions[i];
       const formatEmoji = e.format === 'audiobook' ? '🎧' : e.format === 'ebook' ? '📱' : e.format === 'hardcover' ? '📕' : e.format === 'paperback' ? '📖' : '📚';
-      const caption = `*${i + 1}. ${e.title}*\n${formatEmoji} ${e.format.toUpperCase()}${e.info ? `\n_${e.info}_` : ''}`;
+      const len = absMinutes ? parseDurationMinutes(e.info) : null;
+      const lengthNote = len != null && absMinutes ? `\n⏱ ${formatLengthDiff(len, absMinutes)}` : '';
+      const caption = `*${i + 1}. ${e.title}*\n${formatEmoji} ${e.format.toUpperCase()}${e.info ? `\n_${e.info}_` : ''}${lengthNote}`;
       const keyboard: TelegramBot.InlineKeyboardButton[][] = [[
         { text: `${formatEmoji} Select ${e.format}`, callback_data: makeCallbackData(e) },
       ]];
@@ -538,7 +541,22 @@ export function createBot(options: CreateBotOptions): Bot {
           const lower = e.info.toLowerCase();
           return lower.includes('english') || (!lower.includes('spanish') && !lower.includes('french') && !lower.includes('german') && !lower.includes('portuguese') && !lower.includes('italian'));
         });
-        const filteredAudio = englishAudio.length > 0 ? englishAudio : audioEditions;
+        const absMinutes = !absBook?.isEbook && absBook?.durationSeconds ? absBook.durationSeconds / 60 : null;
+        // Pick automatically only when it's unambiguous: an ISBN/ASIN match, an
+        // unambiguous length match, or a single edition of the right kind.
+        const pick = pickEdition(allEditions, '', {
+          asin: absBook?.asin, isbn: absBook?.isbn, kind: absBook?.isEbook ? 'digital' : 'audio',
+          absMinutes, language: absBook?.language,
+        });
+        if (pick.reason === 'id' || pick.reason === 'duration') {
+          const picked = allEditions.find((e) => e.bookUrl === pick.url);
+          await reply(cid, `🎯 Auto-picked the ${kindLabel} edition — ${formatMatchReason(pick.reason, absMinutes)}.${picked?.info ? `\n_${escapeMd(picked.info)}_` : ''}`);
+          await finishLink(cid, absId, absBook, pick.url);
+          return;
+        }
+        const preferred = englishAudio.length > 0 ? englishAudio : audioEditions;
+        // Closest length first, so the right one is near the top when we must ask.
+        const filteredAudio = absMinutes ? sortByDurationMatch(preferred, absMinutes) : preferred;
 
         if (filteredAudio.length === 0) {
           if (allEditions.length === 0) {
@@ -566,12 +584,15 @@ export function createBot(options: CreateBotOptions): Bot {
         const first = filteredAudio.slice(0, PAGE_SIZE);
         await sendEditionResults(cid, first,
           (e) => `lk_ed:${absId}:${cacheUrl(e.bookUrl)}`,
-          `Found ${filteredAudio.length} ${kindLabel} editions (showing first ${Math.min(PAGE_SIZE, filteredAudio.length)}):`);
+          `Found ${filteredAudio.length} ${kindLabel} editions — couldn't pick one safely` +
+            (absMinutes ? `. Your audiobook is *${formatLength(absMinutes)}*; closest length first:` : ` (showing first ${Math.min(PAGE_SIZE, filteredAudio.length)}):`),
+          absMinutes);
 
         if (filteredAudio.length > PAGE_SIZE) {
           // Cache the remaining editions for "show more"
           const remainingId = cacheUrl(JSON.stringify({
             absId,
+            absMinutes,
             editions: filteredAudio.slice(PAGE_SIZE).map((e) => ({
               ...e,
               bookUrl: e.bookUrl,
@@ -599,18 +620,20 @@ export function createBot(options: CreateBotOptions): Bot {
       const cached = getCachedUrl(cacheId);
       if (!cached) { await reply(cid, 'Button expired. Please search again.'); return; }
       try {
-        const { absId: moreAbsId, editions: moreEditions } = JSON.parse(cached) as {
+        const { absId: moreAbsId, editions: moreEditions, absMinutes: moreAbsMinutes } = JSON.parse(cached) as {
           absId: string;
           editions: StoryGraphEdition[];
+          absMinutes?: number | null;
         };
         const PAGE_SIZE = 3;
         const page = moreEditions.slice(0, PAGE_SIZE);
         await sendEditionResults(cid, page,
           (e) => `lk_ed:${moreAbsId}:${cacheUrl(e.bookUrl)}`,
-          `More audiobook editions:`);
+          `More audiobook editions:`, moreAbsMinutes);
         if (moreEditions.length > PAGE_SIZE) {
           const nextId = cacheUrl(JSON.stringify({
             absId: moreAbsId,
+            absMinutes: moreAbsMinutes,
             editions: moreEditions.slice(PAGE_SIZE),
           }));
           await reply(cid, `${moreEditions.length - PAGE_SIZE} more available.`, {
@@ -1003,12 +1026,14 @@ export function createBot(options: CreateBotOptions): Bot {
       // Auto-match by ASIN/ISBN first: if the top result has an edition whose
       // identifier matches ABS's, link it directly. (Often misses for audiobooks,
       // since ABS frequently carries the print ISBN — falls back to manual pick.)
-      const identifier = absBook.asin || absBook.isbn;
-      if (identifier && deduped.length > 0) {
+      // Try every ID ABS has: the ASIN is often Audible's, which StoryGraph may not list
+      // even when it lists the ISBN.
+      for (const [label, identifier] of [['ASIN', absBook.asin], ['ISBN', absBook.isbn]] as const) {
+        if (!identifier || deduped.length === 0) continue;
         try {
           const match = await storygraph.findEditionByIdentifier(deduped[0].bookUrl, identifier);
-          if (match) {
-            await reply(chatIdTarget, `🔎 Auto-matched by ${absBook.asin ? 'ASIN' : 'ISBN'} \`${escapeMd(identifier)}\` → ${match.format} edition.`);
+          if (match && (absBook.isEbook ? isDigitalFormat(match.format) : isAudioFormat(match.format))) {
+            await reply(chatIdTarget, `🔎 Auto-matched by ${label} \`${escapeMd(identifier)}\` → ${match.format} edition.`);
             await finishLink(chatIdTarget, absId, absBook, match.bookUrl);
             return;
           }
@@ -1039,9 +1064,10 @@ export function createBot(options: CreateBotOptions): Bot {
   ): Promise<void> {
     const linked = await linkBook(db, storygraph, absId, absBook, storygraphBookUrl);
     storygraphBookUrl = linked.storygraphBookUrl;
+    const absMinutes = !absBook?.isEbook && absBook?.durationSeconds ? absBook.durationSeconds / 60 : null;
     await reply(
       cid,
-      `✅ Linked *${escapeMd(absBook?.title ?? absId)}* and marked as currently reading.\n${storygraphBookUrl}\n\n⏳ Backfilling listening history from Audiobookshelf…`
+      `✅ Linked *${escapeMd(absBook?.title ?? absId)}* (${formatMatchReason(linked.matchReason, absMinutes)}) and marked as currently reading.\n${storygraphBookUrl}\n\n⏳ Backfilling listening history from Audiobookshelf…`
     );
     const mapping = db.getBookMappingByAbsId(absId);
     if (!mapping) return;

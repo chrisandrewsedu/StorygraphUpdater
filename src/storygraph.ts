@@ -78,27 +78,110 @@ export function isDigitalFormat(format: string | null | undefined): boolean {
   return format === 'digital' || format === 'ebook' || format === 'kindle';
 }
 
+/** An audio edition's length in minutes from its info line ("3h 21m • audio • 2018"), or null. */
+export function parseDurationMinutes(info: string): number | null {
+  const m = info.match(/(?:^|\n)\s*(?:(\d+)h)?\s*(?:(\d+)m)?\s*•\s*audio/i);
+  if (!m || (m[1] == null && m[2] == null)) return null;
+  return parseInt(m[1] ?? '0', 10) * 60 + parseInt(m[2] ?? '0', 10);
+}
+
+/** The "Language: X" value from an edition's info, or null. */
+export function parseEditionLanguage(info: string): string | null {
+  return info.match(/Language:\s*([^\n]+)/)?.[1]?.trim() || null;
+}
+
+const LANGUAGE_CODES: Record<string, string> = { en: 'english', eng: 'english', es: 'spanish', spa: 'spanish', fr: 'french', fre: 'french', fra: 'french', de: 'german', ger: 'german', deu: 'german' };
+const normLanguage = (l: string | null | undefined) => {
+  const v = (l ?? '').trim().toLowerCase();
+  return v ? LANGUAGE_CODES[v] ?? v : null;
+};
+
+/** Length match tolerance: StoryGraph rounds to whole minutes, ABS has seconds. */
+const DURATION_MATCH_MIN = 2;
+/** Another same-language edition this close (but not matching) means we can't be sure. */
+const DURATION_AMBIGUOUS_MIN = 10;
+
+/**
+ * The audio edition whose length matches the ABS audiobook — only when that is
+ * unambiguous: some edition within 2 min, all such matches in one language (ABS's
+ * language if known), and no other edition in that language 2–10 min off.
+ * Different narrations/dramatizations of a book differ by far more than that.
+ */
+function matchByDuration(
+  audio: StoryGraphEdition[],
+  absMinutes: number,
+  language: string | null | undefined
+): StoryGraphEdition | null {
+  const withLen = audio
+    .map((e) => ({ e, min: parseDurationMinutes(e.info), lang: normLanguage(parseEditionLanguage(e.info)) }))
+    .filter((x): x is { e: StoryGraphEdition; min: number; lang: string | null } => x.min != null);
+  let matches = withLen.filter((x) => Math.abs(x.min - absMinutes) <= DURATION_MATCH_MIN);
+  const wanted = normLanguage(language);
+  if (wanted) matches = matches.filter((x) => x.lang === wanted || x.lang == null);
+  if (!matches.length) return null;
+  const langs = new Set(matches.map((x) => x.lang).filter(Boolean));
+  if (langs.size > 1) return null;
+  const lang = wanted ?? [...langs][0] ?? null;
+  const nearMiss = withLen.some((x) => {
+    const diff = Math.abs(x.min - absMinutes);
+    return diff > DURATION_MATCH_MIN && diff <= DURATION_AMBIGUOUS_MIN && (x.lang === lang || x.lang == null || lang == null);
+  });
+  if (nearMiss) return null;
+  return [...matches].sort((a, b) => Math.abs(a.min - absMinutes) - Math.abs(b.min - absMinutes))[0].e;
+}
+
+/** Audio editions ordered by how close their length is to the ABS audiobook (unknown last). */
+export function sortByDurationMatch(editions: StoryGraphEdition[], absMinutes: number): StoryGraphEdition[] {
+  const diff = (e: StoryGraphEdition) => {
+    const min = parseDurationMinutes(e.info);
+    return min == null ? Number.POSITIVE_INFINITY : Math.abs(min - absMinutes);
+  };
+  return [...editions].sort((a, b) => diff(a) - diff(b));
+}
+
+/** Why an edition was picked — shown in Telegram so a wrong pick is easy to spot. */
+export type EditionPickReason = 'id' | 'chosen' | 'duration' | 'only' | 'none';
+
 /**
  * Pick the edition of the given kind to track a book against: audio for an
  * audiobook (journal minutes are only kept on audio editions; print records
- * "0 pages"), digital for an ebook. Prefers the edition matching ABS's
- * ASIN/ISBN, then the chosen URL if it is already that kind, then the only
- * edition of that kind. Otherwise keeps the chosen URL.
+ * "0 pages"), digital for an ebook. In order: the edition matching ABS's ASIN or
+ * ISBN (both are tried); the chosen URL if it is already that kind (an explicit
+ * pick); for audio, an unambiguous length match; the only edition of that kind.
+ * Otherwise keeps the chosen URL (reason 'none').
  */
+export function pickEdition(
+  editions: StoryGraphEdition[],
+  chosenUrl: string,
+  opts: {
+    asin: string | null | undefined;
+    isbn: string | null | undefined;
+    kind: EditionKind;
+    absMinutes?: number | null;
+    language?: string | null;
+  }
+): { url: string; reason: EditionPickReason } {
+  const isKind = opts.kind === 'audio' ? isAudioFormat : isDigitalFormat;
+  const ofKind = editions.filter((e) => isKind(e.format));
+  const byId = matchEditionByIdentifier(ofKind, opts.asin) ?? matchEditionByIdentifier(ofKind, opts.isbn);
+  if (byId) return { url: byId.bookUrl, reason: 'id' };
+  if (ofKind.some((e) => e.bookUrl === chosenUrl)) return { url: chosenUrl, reason: 'chosen' };
+  if (opts.kind === 'audio' && opts.absMinutes) {
+    const byLength = matchByDuration(ofKind, opts.absMinutes, opts.language);
+    if (byLength) return { url: byLength.bookUrl, reason: 'duration' };
+  }
+  const unique = new Set(ofKind.map((e) => e.bookUrl));
+  if (unique.size === 1) return { url: ofKind[0].bookUrl, reason: 'only' };
+  return { url: chosenUrl, reason: 'none' };
+}
+
 export function chooseEdition(
   editions: StoryGraphEdition[],
   chosenUrl: string,
   ids: { asin: string | null | undefined; isbn: string | null | undefined },
   kind: EditionKind
 ): string {
-  const isKind = kind === 'audio' ? isAudioFormat : isDigitalFormat;
-  const ofKind = editions.filter((e) => isKind(e.format));
-  const byId = matchEditionByIdentifier(ofKind, ids.asin) ?? matchEditionByIdentifier(ofKind, ids.isbn);
-  if (byId) return byId.bookUrl;
-  if (ofKind.some((e) => e.bookUrl === chosenUrl)) return chosenUrl;
-  const unique = new Set(ofKind.map((e) => e.bookUrl));
-  if (unique.size === 1) return ofKind[0].bookUrl;
-  return chosenUrl;
+  return pickEdition(editions, chosenUrl, { ...ids, kind }).url;
 }
 
 export function chooseAudioEdition(

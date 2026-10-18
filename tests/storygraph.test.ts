@@ -12,6 +12,10 @@ import {
   parseBookPageFormat,
   starsDecimalValue,
   serializeMethods,
+  parseDurationMinutes,
+  parseEditionLanguage,
+  pickEdition,
+  sortByDurationMatch,
   type StoryGraphEdition,
   type StoryGraphBook,
 } from '../src/storygraph.js';
@@ -286,5 +290,88 @@ describe('serializeMethods', () => {
     const [bad, good] = await Promise.allSettled([obj.bad(), obj.good()]);
     expect(bad.status).toBe('rejected');
     expect(good).toEqual({ status: 'fulfilled', value: 'ok' });
+  });
+});
+
+describe('parseDurationMinutes / parseEditionLanguage', () => {
+  it('reads an audio length from the edition info line', () => {
+    expect(parseDurationMinutes('3h 21m • audio • 2018\nLanguage: English')).toBe(201);
+    expect(parseDurationMinutes('12h  30m • audio • 2026')).toBe(750);
+    expect(parseDurationMinutes('45m • audio • 2020')).toBe(45);
+    expect(parseDurationMinutes('3h • audio • 2020')).toBe(180);
+  });
+  it('returns null for print editions or a missing length', () => {
+    expect(parseDurationMinutes('301 pages • hardcover • 2026')).toBeNull();
+    expect(parseDurationMinutes('Language: Spanish\nPublisher: Rba')).toBeNull();
+  });
+  it('reads the language', () => {
+    expect(parseEditionLanguage('3h 21m • audio • 2018\nLanguage: English\nPublisher: X')).toBe('English');
+    expect(parseEditionLanguage('3h 21m • audio • 2018')).toBeNull();
+  });
+});
+
+describe('pickEdition — Artificial Condition (real StoryGraph data, 2026-10)', () => {
+  const ed = (id: string, isbn: string | null, info: string, format = 'audio') =>
+    edition({ bookUrl: `https://app.thestorygraph.com/books/${id}`, isbn, info, format });
+  const PRINT = ed('print', '9781250186928', '158 pages • hardcover • 2018\nLanguage: English', 'hardcover');
+  const RB = ed('rb', '9781501977831', '3h 21m • audio • 2018\nLanguage: English\nPublisher: Recorded Books');
+  const GA = ed('ga', '9798212912877', '2h 45m • audio • 2018\nLanguage: English\nPublisher: GraphicAudio');
+  const RB2 = ed('rb2', 'B07BFDDQJZ', '3h 21m • audio • 2018\nLanguage: English\nPublisher: Recorded Books, Inc');
+  const NL = ed('nl', '9789026177132', '3h 26m • audio • 2018\nLanguage: Dutch\nPublisher: De Fontein');
+  const FI = ed('fi', '9789524060202', '4h 47m • audio • 2018\nLanguage: Finnish');
+  const ES = ed('es', '9781638119722', 'Language: Spanish\nPublisher: Rba');
+  const ALL = [PRINT, GA, RB2, NL, FI, ES, RB];
+  const abs = { asin: 'B07BFDDWXN', isbn: '9781501977831', kind: 'audio' as const, absMinutes: 201, language: null };
+
+  it('tries the ISBN when the ASIN is not on StoryGraph', () => {
+    expect(pickEdition(ALL, PRINT.bookUrl, abs)).toMatchObject({ url: RB.bookUrl, reason: 'id' });
+  });
+
+  it('matches by length when no ID is on StoryGraph — the Dutch 3h 26m translation does not block it', () => {
+    const pick = pickEdition(ALL, PRINT.bookUrl, { ...abs, asin: 'B0NOTHERE', isbn: null });
+    expect(pick.reason).toBe('duration');
+    expect([RB.bookUrl, RB2.bookUrl]).toContain(pick.url); // same 3h 21m recording either way
+  });
+
+  it('never picks the 2h 45m GraphicAudio dramatization for a 3h 21m audiobook', () => {
+    const pick = pickEdition(ALL, PRINT.bookUrl, { ...abs, asin: null, isbn: null });
+    expect(pick.url).not.toBe(GA.bookUrl);
+  });
+
+  it('does not guess when another same-language edition is suspiciously close (2–10 min off)', () => {
+    const close = ed('close', null, '3h 27m • audio • 2018\nLanguage: English');
+    const pick = pickEdition([PRINT, RB, close], PRINT.bookUrl, { ...abs, asin: null, isbn: null });
+    expect(pick.reason).toBe('none');
+    expect(pick.url).toBe(PRINT.bookUrl);
+  });
+
+  it('does not guess when length matches in two languages and ABS has no language', () => {
+    const fr = ed('fr', null, '3h 21m • audio • 2018\nLanguage: French');
+    expect(pickEdition([PRINT, RB, fr], PRINT.bookUrl, { ...abs, asin: null, isbn: null }).reason).toBe('none');
+    expect(pickEdition([PRINT, RB, fr], PRINT.bookUrl, { ...abs, asin: null, isbn: null, language: 'en' }))
+      .toMatchObject({ url: RB.bookUrl, reason: 'duration' });
+  });
+
+  it('keeps an edition the user explicitly picked when it is already audio', () => {
+    expect(pickEdition(ALL, GA.bookUrl, { ...abs, asin: null, isbn: null })).toMatchObject({ url: GA.bookUrl, reason: 'chosen' });
+  });
+
+  it('prefers the closest length when several are within the tolerance', () => {
+    const near = ed('near', null, '3h 19m • audio • 2018\nLanguage: English');
+    expect(pickEdition([PRINT, near, RB], PRINT.bookUrl, { ...abs, asin: null, isbn: null }).url).toBe(RB.bookUrl);
+  });
+
+  it('does not match by length for ebooks', () => {
+    expect(pickEdition(ALL, PRINT.bookUrl, { ...abs, asin: null, isbn: null, kind: 'digital' }).reason).not.toBe('duration');
+  });
+});
+
+describe('sortByDurationMatch', () => {
+  it('orders audio editions by closeness to the ABS length, unknown lengths last', () => {
+    const a = edition({ bookUrl: 'a', info: '2h 45m • audio • 2018' });
+    const b = edition({ bookUrl: 'b', info: '3h 21m • audio • 2018' });
+    const c = edition({ bookUrl: 'c', info: 'Language: Spanish' });
+    const d = edition({ bookUrl: 'd', info: '3h 26m • audio • 2018' });
+    expect(sortByDurationMatch([a, c, d, b], 201).map((e) => e.bookUrl)).toEqual(['b', 'd', 'a', 'c']);
   });
 });

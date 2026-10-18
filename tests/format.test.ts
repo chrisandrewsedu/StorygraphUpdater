@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { escapeMd, formatDayLine, formatBackfillSummary, formatSmokeReport } from '../src/format.js';
+import { escapeMd, formatDayLine, formatBackfillSummary, formatSmokeReport, formatLength, formatLengthDiff, formatMatchReason } from '../src/format.js';
 import type { SyncResult } from '../src/sync.js';
 
 const write = (date: string, dayMinutes: number, totalMinutes: number, percent: number | undefined): SyncResult => ({
@@ -87,5 +87,24 @@ describe('formatSmokeReport', () => {
     expect(formatSmokeReport({ checked: null, problems: [] }, true)).toBe(
       'ℹ️ StoryGraph check skipped: no synced book to check against yet.\n(Logged in to StoryGraph again — the old session had expired.)'
     );
+  });
+});
+
+describe('formatLength / formatLengthDiff / formatMatchReason', () => {
+  it('formats minutes as hours and minutes', () => {
+    expect(formatLength(201)).toBe('3h 21m');
+    expect(formatLength(45)).toBe('45m');
+    expect(formatLength(201.24)).toBe('3h 21m');
+  });
+  it('describes an edition length against the ABS audiobook', () => {
+    expect(formatLengthDiff(201, 201.24)).toBe('same length as yours');
+    expect(formatLengthDiff(206, 201.24)).toBe('5 min longer than yours');
+    expect(formatLengthDiff(165, 201.24)).toBe('36 min shorter than yours');
+  });
+  it('explains how an edition was chosen', () => {
+    expect(formatMatchReason('id')).toBe('matched by ISBN/ASIN');
+    expect(formatMatchReason('duration', 201.24)).toBe('matched by length (3h 21m)');
+    expect(formatMatchReason('chosen')).toBe('the edition you picked');
+    expect(formatMatchReason('none')).toBe('⚠️ no confident edition match — please check it');
   });
 });

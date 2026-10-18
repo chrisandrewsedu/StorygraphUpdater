@@ -12,6 +12,8 @@ export interface AbsBookProgress {
   coverPath: string | null;
   asin: string | null;
   isbn: string | null;
+  /** ABS metadata language (e.g. "English"), used to disambiguate edition length matches. */
+  language?: string | null;
   /** True for an ebook-only item (an ebook file and no audio tracks). */
   isEbook: boolean;
   /** Ebook reading position, 0–100 (0 when the item has no ebook progress). */
@@ -67,6 +69,7 @@ interface AbsLibraryItem {
       authorName: string;
       asin?: string | null;
       isbn?: string | null;
+      language?: string | null;
     };
     duration: number;
     coverPath: string | null;
@@ -189,6 +192,7 @@ export function createAbsClient(baseUrl: string, apiToken: string): AbsClient {
             coverPath: item.media.coverPath,
             asin: item.media.metadata.asin ?? null,
             isbn: item.media.metadata.isbn ?? null,
+            language: item.media.metadata.language ?? null,
             isEbook,
             ebookPercent,
           };
