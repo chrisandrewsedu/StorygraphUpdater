@@ -228,6 +228,28 @@ describe('reduceSessionsToDailyProgress', () => {
     expect(daily[0].percent).toBeNull();
   });
 
+  it("uses the day's last position, not a stray jump to the end earlier that day", () => {
+    // Real ABS sessions for 2026-10-20 (Artificial Condition, 12074 s long):
+    // the player jumped to the end, then the listener went back to their place.
+    const at = (startTime: number, currentTime: number, updatedAt: number) => ({
+      ...session('2026-10-20', currentTime),
+      id: `s_${updatedAt}`,
+      startTime,
+      duration: 12074,
+      updatedAt,
+    });
+    const daily = reduceSessionsToDailyProgress([
+      at(8828, 9281, 1792555034198),
+      at(6262, 8848, 1792526793871),
+      at(5395, 6262, 1792522763018),
+      at(0, 5395, 1792504160927),
+      at(3551, 12074, 1792503945889), // jump to the end
+      at(2700, 3551, 1792485678775),
+    ]);
+    expect(daily).toHaveLength(1);
+    expect(daily[0]).toMatchObject({ cumulativeSeconds: 9281, cumulativeMinutes: 154, percent: 77 });
+  });
+
   it('clamps a backwards currentTime regression to the prior cumulative', () => {
     const daily = reduceSessionsToDailyProgress([
       session('2026-05-01', 3600), // 60 min
