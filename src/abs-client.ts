@@ -44,7 +44,7 @@ export interface AbsListeningSession {
 /** Cumulative listening progress reached by the end of a given day. */
 export interface AbsDayProgress {
   date: string; // 'YYYY-MM-DD'
-  cumulativeSeconds: number; // furthest position reached by end of day
+  cumulativeSeconds: number; // position at the end of the day (clamped non-decreasing)
   cumulativeMinutes: number; // floor(cumulativeSeconds / 60)
   minutesThatDay: number; // delta vs the previous retained day
   percent: number | null; // % of the book reached by end of day (null if ABS has no duration)
@@ -109,19 +109,29 @@ export function dayInTimeZone(epochMs: number, timeZone: string): string {
 
 /**
  * Reduce raw listening sessions into one cumulative-progress point per day,
- * sorted chronologically. Takes the furthest position reached on each day,
- * clamps the cumulative series to be monotonically non-decreasing (StoryGraph
- * requires increasing progress), and drops days with no forward progress.
+ * sorted chronologically. Takes the position where each day's last session
+ * ended (not the furthest point: a stray seek to the end of the book, then a
+ * seek back, would read as 100%), clamps the cumulative series to be
+ * monotonically non-decreasing (StoryGraph requires increasing progress), and
+ * drops days with no forward progress.
  */
 export function reduceSessionsToDailyProgress(
   sessions: AbsListeningSession[]
 ): AbsDayProgress[] {
-  const maxByDate = new Map<string, number>();
+  const lastByDate = new Map<string, { updatedAt: number; currentTime: number }>();
   const duration = Math.max(0, ...sessions.map((s) => s.duration || 0));
   for (const s of sessions) {
-    const prev = maxByDate.get(s.date) ?? 0;
-    if (s.currentTime > prev) maxByDate.set(s.date, s.currentTime);
+    const prev = lastByDate.get(s.date);
+    const updatedAt = s.updatedAt || 0;
+    if (
+      !prev ||
+      updatedAt > prev.updatedAt ||
+      (updatedAt === prev.updatedAt && s.currentTime > prev.currentTime)
+    ) {
+      lastByDate.set(s.date, { updatedAt, currentTime: s.currentTime });
+    }
   }
+  const maxByDate = new Map([...lastByDate].map(([date, last]) => [date, last.currentTime]));
 
   const dates = [...maxByDate.keys()].sort();
   const result: AbsDayProgress[] = [];
