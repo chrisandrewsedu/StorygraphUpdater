@@ -29,15 +29,23 @@ interface CreateBotOptions {
   storygraphCreds?: { email: string; password: string };
 }
 
+// Long-poll (Telegram holds each request up to 50s) and wait 2s between polls.
+// The default 300ms retry with no backoff logged ~3 errors a second during the
+// daily ~100s network drop.
+// The library sets no HTTP timeout. When the network dropped mid-poll the socket
+// stayed "established" forever, polling never resumed, and button presses were
+// never fetched (2026-10-28). Abort any request well past the long-poll window.
+export const TELEGRAM_BOT_OPTIONS: TelegramBot.ConstructorOptions = {
+  polling: { interval: 2000, params: { timeout: 50 } },
+  request: { timeout: 65_000 } as TelegramBot.ConstructorOptions['request'],
+};
+
 export function createBot(options: CreateBotOptions): Bot {
   const { token, chatId, db, storygraph, absClient } = options;
   const storygraphUsername = options.storygraphUsername ?? 'chrisandrews';
   const storygraphCreds = options.storygraphCreds ?? { email: '', password: '' };
 
-  // Long-poll (Telegram holds each request up to 50s) and wait 2s between polls.
-  // The default 300ms retry with no backoff logged ~3 errors a second during the
-  // daily ~100s network drop.
-  const bot = new TelegramBot(token, { polling: { interval: 2000, params: { timeout: 50 } } });
+  const bot = new TelegramBot(token, TELEGRAM_BOT_OPTIONS);
   let lastPollingErrorLog = 0;
   bot.on('polling_error', (err: Error & { code?: string }) => {
     const now = Date.now();
